@@ -21,7 +21,11 @@ env:
   # Must match RELEASE_ASSET_NAME in src/updater.rs: the in-app updater looks
   # for this exact filename among the release assets and reports no update
   # available if it is missing.
-  RELEASE_ASSET_NAME: stealthy-usage-monitor.exe
+  RELEASE_ASSET_NAME: xilous-usage-monitor.exe
+  # The same binary under the app's former name. Installs from before the
+  # rename look for this asset, so publishing it lets them update into the
+  # renamed app. Drop it once those installs have moved on.
+  LEGACY_RELEASE_ASSET_NAME: stealthy-usage-monitor.exe
 
 jobs:
   build:
@@ -89,14 +93,21 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: stealthy-usage-monitor
+          name: xilous-usage-monitor
           path: target/release/${{ env.RELEASE_ASSET_NAME }}
           retention-days: 30
+
+      - name: Copy binary under the legacy asset name
+        if: steps.release_tag.outputs.tag != ''
+        shell: pwsh
+        run: Copy-Item "target/release/${{ env.RELEASE_ASSET_NAME }}" "target/release/${{ env.LEGACY_RELEASE_ASSET_NAME }}"
 
       - name: Create GitHub Release
         if: steps.release_tag.outputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_tag.outputs.tag }}
-          files: target/release/${{ env.RELEASE_ASSET_NAME }}
+          files: |
+            target/release/${{ env.RELEASE_ASSET_NAME }}
+            target/release/${{ env.LEGACY_RELEASE_ASSET_NAME }}
           generate_release_notes: true

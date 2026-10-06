@@ -1,23 +1,23 @@
 [package]
-name = "stealthy-usage-monitor"
-version = "2.11.0"
+name = "xilous-usage-monitor"
+version = "2.12.0"
 edition = "2021"
 license = "MIT"
-description = "Stealthy Usage Monitor"
-homepage = "https://github.com/Xilous/stealthy-usage-monitor"
+description = "Xilous Usage Monitor"
+homepage = "https://github.com/Xilous/xilous-usage-monitor"
 # The updater derives its GitHub owner/repo from this field at compile time
 # (see github_repo() in src/updater.rs, which parses CARGO_PKG_REPOSITORY).
 # Left on upstream, the fork would check CodeZeno's releases, download their
 # binary and overwrite itself on the next update check.
-repository = "https://github.com/Xilous/stealthy-usage-monitor"
+repository = "https://github.com/Xilous/xilous-usage-monitor"
 
 [package.metadata.winres]
 CompanyName = "Xilous"
-ProductName = "Stealthy Usage Monitor"
-FileDescription = "Stealthy Usage Monitor"
-OriginalFilename = "stealthy-usage-monitor.exe"
-InternalName = "StealthyUsageMonitor"
-Comments = "https://github.com/Xilous/stealthy-usage-monitor"
+ProductName = "Xilous Usage Monitor"
+FileDescription = "Xilous Usage Monitor"
+OriginalFilename = "xilous-usage-monitor.exe"
+InternalName = "XilousUsageMonitor"
+Comments = "https://github.com/Xilous/xilous-usage-monitor"
 # Retained: the code is Code Zeno's, used under MIT.
 LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
 
