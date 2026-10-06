@@ -69,7 +69,7 @@ pub fn open(owner: HWND) {
         }
         *ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()) = Some(window::appearance());
         let instance = GetModuleHandleW(None).unwrap();
-        let class = wide_str("StealthyAppearanceStudio");
+        let class = wide_str("XilousAppearanceStudio");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(proc),
             hInstance: instance.into(),

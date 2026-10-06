@@ -1,4 +1,4 @@
-# Stealthy Usage Monitor
+# Xilous Usage Monitor
 
 A small native Windows desktop widget for Claude, Codex and Antigravity usage.
 This fork's compact cards show quota-window labels, **percentage
@@ -20,7 +20,7 @@ Overall Claude 5h and 7d quotas remain visible.
 
 Claude and Codex are enabled on fresh installs. Existing saved provider choices
 are preserved: right-click a tray icon and enable **Models > Codex**. To start
-with only Codex selected, launch `stealthy-usage-monitor.exe --codex-only`.
+with only Codex selected, launch `xilous-usage-monitor.exe --codex-only`.
 Close any already-running copy first (the app is single-instance).
 
 Sign into Codex with your ChatGPT account. The monitor reads
@@ -104,15 +104,15 @@ cargo build --release --locked
 ```
 
 Both MSVC with Windows build tools and GNU with MinGW-w64 are supported. The
-binary is `target\release\stealthy-usage-monitor.exe`.
+binary is `target\release\xilous-usage-monitor.exe`.
 
 Offline previews exercise the actual GDI renderer at 200% DPI using fixture data;
 they don't read credentials, poll providers, start the tray, or change settings:
 
 ```powershell
-.\target\release\stealthy-usage-monitor.exe --preview dark.bmp
-.\target\release\stealthy-usage-monitor.exe --preview light.bmp --light
-.\target\release\stealthy-usage-monitor.exe --preview unavailable.bmp --unavailable
+.\target\release\xilous-usage-monitor.exe --preview dark.bmp
+.\target\release\xilous-usage-monitor.exe --preview light.bmp --light
+.\target\release\xilous-usage-monitor.exe --preview unavailable.bmp --unavailable
 ```
 
 `--check-codex` performs one read-only Codex poll and writes a sanitized summary

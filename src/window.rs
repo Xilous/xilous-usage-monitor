@@ -308,11 +308,35 @@ fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The app's name before it became Xilous Usage Monitor. Its settings folder
+/// and start-with-Windows value are carried over once by the migrations below.
+const LEGACY_APP_NAME: &str = "StealthyUsageMonitor";
+
 fn settings_path() -> PathBuf {
+    settings_path_in("XilousUsageMonitor")
+}
+
+fn settings_path_in(app_dir: &str) -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata)
-        .join("StealthyUsageMonitor")
-        .join("settings.json")
+    PathBuf::from(appdata).join(app_dir).join("settings.json")
+}
+
+/// Copies settings saved under the legacy name, unless settings already exist
+/// under the current one, so the rename keeps the user's appearance, position
+/// and provider choices.
+fn migrate_legacy_settings() {
+    let path = settings_path();
+    let legacy = settings_path_in(LEGACY_APP_NAME);
+    if path.exists() || !legacy.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::copy(&legacy, &path) {
+        Ok(_) => diagnose::log("migrated settings from the legacy settings folder"),
+        Err(error) => diagnose::log(format!("legacy settings migration failed: {error}")),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1048,7 +1072,7 @@ fn begin_winget_update(hwnd: HWND) {
 }
 
 const STARTUP_REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const STARTUP_REGISTRY_KEY: &str = "StealthyUsageMonitor";
+const STARTUP_REGISTRY_KEY: &str = "XilousUsageMonitor";
 
 /// Returns true only if the startup registry value points to this executable.
 fn is_startup_enabled() -> bool {
@@ -1158,6 +1182,46 @@ fn set_startup_enabled(enable: bool) {
         }
 
         let _ = RegCloseKey(hkey);
+    }
+}
+
+/// Replaces a start-with-Windows value saved under the legacy name with one
+/// under the current name, pointing at this executable.
+fn migrate_legacy_startup() {
+    unsafe {
+        let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
+        let legacy_name = native_interop::wide_str(LEGACY_APP_NAME);
+
+        let mut hkey = HKEY::default();
+        let result = RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR::from_raw(path.as_ptr()),
+            0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            &mut hkey,
+        );
+        if result.is_err() {
+            return;
+        }
+
+        let found = RegQueryValueExW(
+            hkey,
+            PCWSTR::from_raw(legacy_name.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok();
+        if found {
+            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_name.as_ptr()));
+        }
+        let _ = RegCloseKey(hkey);
+
+        if found {
+            set_startup_enabled(true);
+            diagnose::log("migrated the legacy start-with-Windows value");
+        }
     }
 }
 
@@ -1755,7 +1819,7 @@ pub fn run() {
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\StealthyUsageMonitor");
+    let mutex_name = native_interop::wide_str("Global\\XilousUsageMonitor");
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1787,7 +1851,7 @@ pub fn run() {
         }
     };
 
-    let class_name = native_interop::wide_str("StealthyUsageMonitor");
+    let class_name = native_interop::wide_str("XilousUsageMonitor");
 
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null()).unwrap();
@@ -1811,6 +1875,8 @@ pub fn run() {
             diagnose::log("RegisterClassExW returned 0");
         }
 
+        migrate_legacy_settings();
+        migrate_legacy_startup();
         let mut settings = load_settings();
         if std::env::args().any(|arg| arg == "--codex-only") {
             settings.show_claude_code = false;
