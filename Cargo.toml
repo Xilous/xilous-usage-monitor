@@ -1,6 +1,6 @@
 [package]
 name = "xilous-usage-monitor"
-version = "2.12.0"
+version = "2.12.1"
 edition = "2021"
 license = "MIT"
 description = "Xilous Usage Monitor"
