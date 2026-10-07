@@ -41,9 +41,10 @@ in an OS keyring are not supported by this file-based adapter.
   percentage.
 - On an expired Codex sign-in, use Codex to sign in again, then **Refresh** from
   the tray. Credential-file changes are also detected while auth polling is paused.
-- The Codex adapter never runs `codex exec`, sends a prompt, or refreshes tokens
-  itself. The existing Claude adapter still has its upstream inference-based
-  fallback; use `--codex-only` to exclude Claude polling.
+- No adapter runs its CLI, sends a prompt, or refreshes tokens itself. The
+  Claude adapter reads only the read-only usage endpoint and never sends a model
+  request. On an expired Claude sign-in, run `claude` and use `/login`, then
+  **Refresh** from the tray.
 
 The HTTP usage endpoint is an internal service interface, not a stable public
 API. A future adapter can use the documented
