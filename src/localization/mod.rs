@@ -11,7 +11,6 @@ pub struct Strings {
     pub five_minutes: &'static str,
     pub fifteen_minutes: &'static str,
     pub one_hour: &'static str,
-    pub models: &'static str,
     pub claude_code_model: &'static str,
     pub codex_model: &'static str,
     pub antigravity_model: &'static str,
@@ -33,7 +32,6 @@ pub struct Strings {
     pub show_widget: &'static str,
     /// Single-character initials for Sunday through Saturday, in that order,
     /// drawn inside the seven blocks of the weekly bar.
-    pub weekday_initials: [&'static str; 7],
     pub session_window: &'static str,
     pub weekly_window: &'static str,
     pub now: &'static str,

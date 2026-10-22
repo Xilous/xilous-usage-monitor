@@ -660,19 +660,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "xilous-usage-monitor"
-version = "2.12.1"
-dependencies = [
- "dirs",
- "native-tls",
- "serde",
- "serde_json",
- "ureq",
- "windows",
- "winres",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1142,6 +1129,19 @@ name = "writeable"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
+
+[[package]]
+name = "xilous-usage-monitor"
+version = "2.13.0"
+dependencies = [
+ "dirs",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "ureq",
+ "windows",
+ "winres",
+]
 
 [[package]]
 name = "yoke"

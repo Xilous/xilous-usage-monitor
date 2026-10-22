@@ -1,56 +1,37 @@
 # Xilous Usage Monitor
 
-A small native Windows desktop widget for Claude, Codex and Antigravity usage.
-This fork's compact cards show quota-window labels, **percentage
-used**, reset countdowns and warning-coloured gauges. There is no browser runtime.
+A small native Windows desktop widget for Claude Code usage and the device's
+load. There is no browser runtime.
 
-## Claude Fable
+## The widget
 
-The Claude card includes a **Fable** row showing its model-specific quota used
-and reset countdown. It follows the account's reported Fable allocation across
-sessions, not token estimates or an individual agent's share. The Claude tray
-tooltip includes the same reading. Enabling Claude enables this row too.
+Two ring gauges, each with its figures beside it, and no product name on the
+widget itself:
 
-Fable data comes from model-scoped `limits` in the existing Claude usage request;
-no additional request or Fable prompt is sent. Missing or malformed Fable data
-shows **Not reported**, while a valid percentage without a reset shows **Unknown**.
-Overall Claude 5h and 7d quotas remain visible.
+- **Usage** (left): the 5h window on the outer ring and the 7d window on the
+  inner ring, each with its **percentage used** and reset countdown. A short
+  tick across a ring marks where an even spend would have put you; a ring turns
+  amber, then red, when it runs high or well ahead of that pace.
+- **Device** (right): CPU load on the outer ring and RAM in use on the inner
+  ring. Both shift from green through amber to red as headroom runs out.
 
-## Codex
+The widget shows Claude Code only. Codex and Antigravity are no longer shown or
+polled, and any provider choices saved by an older version load as Claude Code
+only. The Claude tray tooltip still includes the model-specific **Fable** quota,
+which comes from the same usage request; no additional request is sent.
 
-Claude and Codex are enabled on fresh installs. Existing saved provider choices
-are preserved: right-click a tray icon and enable **Models > Codex**. To start
-with only Codex selected, launch `xilous-usage-monitor.exe --codex-only`.
-Close any already-running copy first (the app is single-instance).
-
-Sign into Codex with your ChatGPT account. The monitor reads
-`%CODEX_HOME%\auth.json`, or `%USERPROFILE%\.codex\auth.json` when `CODEX_HOME`
-is unset, and makes a read-only request to the existing Codex usage endpoint.
-Credentials are never displayed. API-key billing and credentials stored only
-in an OS keyring are not supported by this file-based adapter.
-
-- Percentages represent the account quota **used**, not remaining, token totals,
-  dollar spend, or separate Astra/Sol consumption.
-- Codex displays only the general **7d** quota, including its reset countdown.
-  Its tray badge and tooltip also use weekly usage. The 5h row is hidden;
-  model-specific limits such as Codex-Spark are not substituted for Codex usage.
-  Quotas are mapped by reported duration, not response order.
+- Percentages represent the account quota **used**, not remaining, token totals
+  or dollar spend.
 - An em dash is unavailable data, never a fabricated 0%. `Offline` means the
   provider failed; `Waiting` means loading/retrying; `Not reported` means that
   quota window was absent. `Unknown` is an unavailable reset time with a valid
   percentage.
-- On an expired Codex sign-in, use Codex to sign in again, then **Refresh** from
-  the tray. Credential-file changes are also detected while auth polling is paused.
-- No adapter runs its CLI, sends a prompt, or refreshes tokens itself. The
-  Claude adapter reads only the read-only usage endpoint and never sends a model
-  request. On an expired Claude sign-in, run `claude` and use `/login`, then
-  **Refresh** from the tray.
+- The adapter never runs a CLI, sends a prompt, or refreshes tokens itself. It
+  reads only the read-only usage endpoint. On an expired Claude sign-in, run
+  `claude` and use `/login`, then **Refresh** from the tray.
 
 The HTTP usage endpoint is an internal service interface, not a stable public
-API. A future adapter can use the documented
-[Codex app-server rate-limit API](https://developers.openai.com/codex/app-server)
-to support CLI-managed authentication. This build retains the repository's
-existing lightweight HTTP adapter.
+API.
 
 ## Windows behaviour
 
@@ -74,13 +55,10 @@ and the slider also takes the arrow keys and PageUp/PageDown. High-usage warning
 gauges retain their amber/red semantic colors. Customization applies to the
 widget, not the Windows shell's notification-area icon badges.
 
-At the default 100% widget size, the widget is 62 logical pixels tall to fit
-Claude's Fable row, and each provider takes 174 logical pixels with an 8-pixel
-gap. The **Widget size** slider scales all of that from 75% to 200%, on top of
-monitor DPI scaling. Each provider is identified by its accent colour (set in the appearance studio), and
-the used/reset header explains the figures. Dark and light system themes are
-supported. Animation runs at 10 Hz, RAM sampling at 2 seconds; neither causes
-additional network polls.
+At the default 100% widget size, the widget is 310 by 62 logical pixels. The
+**Widget size** slider scales that from 75% to 200%, on top of monitor DPI
+scaling. Dark and light system themes are supported. Animation runs at 10 Hz,
+CPU and RAM sampling at 2 seconds; neither causes additional network polls.
 
 The widget floats above normal application windows. **Drag anywhere on it** to
 move it in any direction, including between monitors. It always stays fully on
@@ -91,9 +69,10 @@ back to the bottom of the screen. On a fresh start it appears near the
 top-right of the primary display. Removed monitors, a changed display layout,
 or a larger widget size bring it back fully on screen at the nearest spot.
 
-Right-click the widget or its tray icon for providers, refresh, visibility, and
-**Reset Position** (returns it to the top-right). Old taskbar/click-through
-settings migrate to interactive floating mode; provider choices are preserved.
+Right-click the widget or its tray icon for appearance, refresh, update
+frequency, settings, visibility, and **Reset Position** (returns it to the
+top-right). The menu always opens above the widget. Old taskbar/click-through
+settings migrate to interactive floating mode.
 
 ## Build and verify
 

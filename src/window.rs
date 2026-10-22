@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,10 +9,8 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::SystemInformation::{
-    GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
-};
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows::Win32::System::Threading::{CreateMutexW, GetSystemTimes, WaitForSingleObject};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -22,7 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::appearance::{Appearance, Mode, WIDGET_SIZE_DEFAULT};
 use crate::diagnose;
 use crate::localization::{self, Strings};
-use crate::models::{AppUsageData, UsageData};
+use crate::models::AppUsageData;
 use crate::native_interop::{
     self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL,
     TIMER_TOPMOST, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
@@ -125,9 +123,6 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
-const IDM_MODEL_CLAUDE_CODE: u16 = 60;
-const IDM_MODEL_CODEX: u16 = 61;
-const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_APPEARANCE: u16 = 80;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
@@ -139,6 +134,9 @@ const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// True while the context menu is open; the topmost re-assert waits for it.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
@@ -398,7 +396,7 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
-            show_codex: true,
+            show_codex: false,
             show_antigravity: false,
             embed_in_taskbar: default_embed_in_taskbar(),
             click_through: default_click_through(),
@@ -428,7 +426,7 @@ fn default_show_claude_code() -> bool {
 }
 
 fn default_show_codex() -> bool {
-    true
+    false
 }
 
 fn default_show_antigravity() -> bool {
@@ -442,10 +440,17 @@ fn load_settings() -> SettingsFile {
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
     migrate_desktop_settings(&mut settings);
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
-        settings.show_claude_code = true;
-    }
+    show_only_claude_code(&mut settings);
     settings
+}
+
+/// The widget shows one provider, so whatever an older version saved, only
+/// Claude Code is polled and drawn. The flags stay in the file so the poller
+/// and tray keep their single code path.
+fn show_only_claude_code(settings: &mut SettingsFile) {
+    settings.show_claude_code = true;
+    settings.show_codex = false;
+    settings.show_antigravity = false;
 }
 
 fn migrate_desktop_settings(settings: &mut SettingsFile) {
@@ -489,7 +494,10 @@ fn save_state_settings() {
 
 fn fable_readout_from_state(s: &AppState) -> (f64, String) {
     if !s.last_poll_ok {
-        return (0.0, if s.weekly_text == "!" { "!" } else { "..." }.to_owned());
+        return (
+            0.0,
+            if s.weekly_text == "!" { "!" } else { "..." }.to_owned(),
+        );
     }
     match s.data.as_ref().and_then(|data| data.claude_code.as_ref()) {
         Some(usage) => {
@@ -500,7 +508,11 @@ fn fable_readout_from_state(s: &AppState) -> (f64, String) {
             );
             (
                 usage.fable.percentage,
-                if reset.is_empty() { "--".to_owned() } else { reset },
+                if reset.is_empty() {
+                    "--".to_owned()
+                } else {
+                    reset
+                },
             )
         }
         None => (0.0, "!".to_owned()),
@@ -1225,42 +1237,37 @@ fn migrate_legacy_startup() {
     }
 }
 
-// Compact provider cards with an additional Claude Fable quota row.
+// Two ring blocks side by side: usage (5h outer, 7d inner), then the device
+// (CPU outer, RAM inner), each with its figures to the right of the rings.
 const WIDGET_HEIGHT: i32 = 62;
+const WIDGET_W: i32 = 310;
 const LEFT_DIVIDER_W: i32 = 3;
 
-/// Device RAM: a narrow column between the drag handle and the figures.
-const RAM_X: i32 = 13;
-const RAM_Y: i32 = 9;
-const RAM_W: i32 = 5;
-const RAM_H: i32 = 28;
+/// Ring blocks: where each ring sits, its diameter, and the band geometry.
+const USAGE_X: i32 = 12;
+const SYSTEM_X: i32 = 186;
+const RING_Y: i32 = 6;
+const RING_D: i32 = 50;
+const RING_STROKE: i32 = 5;
+const RING_GAP: i32 = 3;
 
-/// Where the first provider's figures start, and what each provider occupies.
-const CONTENT_X: i32 = 28;
-const PROVIDER_W: i32 = 174;
-const PROVIDER_GAP: i32 = 8;
-/// Space reserved for the quota-window label.
-const LABEL_W: i32 = 42;
+/// The hairline between the usage block and the device block.
+const SPLIT_X: i32 = 178;
+const SPLIT_Y: i32 = 14;
+const SPLIT_H: i32 = 34;
 
-/// Row origins and the offsets within a row.
-///
-/// The 62px budget holds an 11px header and three 12px figure bands, each
-/// followed by its gauge and breathing room.
-const ROW1_Y: i32 = 13;
-const ROW2_Y: i32 = 29;
-const ROW_H: i32 = 12;
-const FIGURE_W: i32 = 38;
-const TIME_DX: i32 = 40;
-const RULE_DY: i32 = 13;
-const RULE_W: i32 = 122;
-const DAY_DY: i32 = 17;
-const DAY_BAND_H: i32 = 10;
+/// The figure column beside each ring: label, percentage, then (usage only)
+/// the time to reset. One row per ring, outer ring first.
+const TEXT_DX: i32 = 58;
+const LABEL_W: i32 = 24;
+const FIGURE_W: i32 = 34;
+const RESET_W: i32 = 46;
+const ROW1_Y: i32 = 15;
+const ROW2_Y: i32 = 33;
+const ROW_H: i32 = 14;
 
-/// Blocks in the weekly window, one per day.
-const WEEKLY_BLOCKS: i32 = 7;
-
-/// How often the live RAM reading is sampled. The paint eases toward whatever
-/// this last stored, so the column drifts continuously between samples.
+/// How often the live CPU and RAM readings are sampled. The paint eases toward
+/// whatever this last stored, so the rings drift continuously between samples.
 const RAM_REFRESH_MS: u32 = 2000;
 
 /// Ambient-animation cadence (10fps). Drives the breath, the settling
@@ -1287,98 +1294,6 @@ fn claude_pace_markers(data: Option<&AppUsageData>) -> (Option<f64>, Option<f64>
             pace_percent(usage.weekly.resets_at, WEEKLY_WINDOW),
         ),
         None => (None, None),
-    }
-}
-
-/// Days from 1970-01-01 for a proleptic-Gregorian civil date. Howard Hinnant's
-/// `days_from_civil`; std has no calendar arithmetic and the widget only ever
-/// needs whole days, so a date crate would be all cost and no benefit.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = y - (m <= 2) as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// Seconds the local clock currently runs ahead of UTC, DST included. Windows
-/// hands over the local wall clock directly, so the offset is that minus the
-/// unix clock. The two readings are taken microseconds apart but can still
-/// straddle a second boundary; real offsets are whole minutes, so the rounding
-/// discards that jitter.
-fn local_utc_offset_secs() -> i64 {
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let lt = unsafe { GetLocalTime() };
-    let local = days_from_civil(lt.wYear as i64, lt.wMonth as i64, lt.wDay as i64) * 86_400
-        + lt.wHour as i64 * 3_600
-        + lt.wMinute as i64 * 60
-        + lt.wSecond as i64;
-    (((local - now_unix) as f64) / 60.0).round() as i64 * 60
-}
-
-/// Which local calendar day an instant falls on, as days from 1970-01-01.
-/// Every instant is shifted by *today's* offset, so a reset landing within an
-/// hour of midnight on the far side of a DST change can name the neighbouring
-/// day. That is the whole error budget, and it is not worth a timezone database.
-fn local_day_number(t: SystemTime) -> Option<i64> {
-    let unix = t.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    Some((unix + local_utc_offset_secs()).div_euclid(86_400))
-}
-
-/// Weekday of a day number, 0 = Sunday. 1970-01-01 was a Thursday.
-fn weekday_of(day_number: i64) -> usize {
-    (day_number + 4).rem_euclid(7) as usize
-}
-
-/// The weekly bar's seven blocks resolved to real weekdays.
-///
-/// The window ends when the quota resets, so the rightmost block is the day the
-/// reset lands on and the six to its left walk backwards from there: a Saturday
-/// reset makes the row read Sun through Sat.
-#[derive(Clone, Copy)]
-struct WeekBlocks {
-    /// Weekday index (0 = Sunday) per block, left to right.
-    days: [usize; WEEKLY_BLOCKS as usize],
-    /// Block covering today. `None` once the reset instant has gone stale and
-    /// today no longer falls inside the window it describes.
-    today: Option<usize>,
-}
-
-fn week_blocks(resets_at: Option<SystemTime>) -> Option<WeekBlocks> {
-    let last = local_day_number(resets_at?)?;
-    let mut days = [0usize; WEEKLY_BLOCKS as usize];
-    for (i, day) in days.iter_mut().enumerate() {
-        *day = weekday_of(last - (WEEKLY_BLOCKS as i64 - 1 - i as i64));
-    }
-    let today = local_day_number(SystemTime::now())
-        .map(|now| WEEKLY_BLOCKS as i64 - 1 - (last - now))
-        .filter(|i| (0..WEEKLY_BLOCKS as i64).contains(i))
-        .map(|i| i as usize);
-    Some(WeekBlocks { days, today })
-}
-
-/// Weekly-bar day markers for every model, resolved once per paint. A model
-/// with no known reset time keeps plain, unlabelled dividers.
-#[derive(Clone, Copy, Default)]
-struct WeekMarkers {
-    claude: Option<WeekBlocks>,
-    codex: Option<WeekBlocks>,
-    antigravity: Option<WeekBlocks>,
-}
-
-fn week_markers(data: Option<&AppUsageData>) -> WeekMarkers {
-    let blocks = |usage: Option<&UsageData>| week_blocks(usage.and_then(|u| u.weekly.resets_at));
-    match data {
-        Some(d) => WeekMarkers {
-            claude: blocks(d.claude_code.as_ref()),
-            codex: blocks(d.codex.as_ref()),
-            antigravity: blocks(d.antigravity.as_ref()),
-        },
-        None => WeekMarkers::default(),
     }
 }
 
@@ -1409,15 +1324,6 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
-}
-
-/// Bars are one width no matter how many models are on screen. The weekly row
-/// stamps a weekday initial into each of its seven blocks, and a block only
-/// clears a glyph at the full segment count: the old narrower bars for two and
-/// three models left blocks about seven and five pixels wide, where nothing
-/// legible fits. The widget is wider for it.
 /// Live physical-memory load as a percentage, with the fraction kept.
 /// `dwMemoryLoad` is only ever a whole number, so a steady machine looks frozen
 /// through it; the byte counters move continuously, which is what lets the
@@ -1458,42 +1364,66 @@ fn last_ram_sample() -> f64 {
     }
 }
 
-fn provider_slot_width() -> i32 {
-    widget_sc(PROVIDER_W) + widget_sc(PROVIDER_GAP)
+/// Total CPU load across all cores since the previous call, as a percentage.
+/// GetSystemTimes counts idle time inside kernel time, so busy is everything
+/// in kernel plus user that was not idle. The first call has nothing to diff
+/// against and reports 0.
+fn current_cpu_percent() -> f64 {
+    static LAST: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let as_u64 = |t: FILETIME| (t.dwHighDateTime as u64) << 32 | t.dwLowDateTime as u64;
+    let (mut idle, mut kernel, mut user) = (
+        FILETIME::default(),
+        FILETIME::default(),
+        FILETIME::default(),
+    );
+    if unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.is_err() {
+        return 0.0;
+    }
+    let idle = as_u64(idle);
+    let total = as_u64(kernel) + as_u64(user);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let percent = match *last {
+        Some((last_idle, last_total)) if total > last_total => {
+            let busy = (total - last_total).saturating_sub(idle.saturating_sub(last_idle));
+            (busy as f64 / (total - last_total) as f64 * 100.0).clamp(0.0, 100.0)
+        }
+        _ => 0.0,
+    };
+    *last = Some((idle, total));
+    percent
 }
 
-/// Widget width for a model count at a given DPI and WIDGET SIZE, the same
-/// sum `provider_slot_width` and the paint use, at explicit values.
-fn widget_width_at(active_models: i32, dpi: u32, widget_size: u32) -> i32 {
-    let s = |px| scale_px(px, dpi, widget_size);
-    s(CONTENT_X) + (s(PROVIDER_W) + s(PROVIDER_GAP)) * active_models - s(PROVIDER_GAP)
+/// Most recent CPU sample in hundredths of a percent, written by the RAM timer
+/// alongside the RAM sample and eased toward by every paint.
+static CPU_SAMPLE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn sample_cpu() {
+    CPU_SAMPLE.store(
+        (current_cpu_percent() * 100.0).round() as u32,
+        Ordering::Relaxed,
+    );
 }
 
-fn total_widget_width_for(active_models: i32) -> i32 {
-    widget_width_at(
-        active_models,
-        CURRENT_DPI.load(Ordering::Relaxed),
-        WIDGET_SIZE.load(Ordering::Relaxed),
-    )
+fn last_cpu_sample() -> f64 {
+    match CPU_SAMPLE.load(Ordering::Relaxed) {
+        u32::MAX => {
+            sample_cpu();
+            0.0
+        }
+        v => v as f64 / 100.0,
+    }
 }
 
-fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+/// Widget width at a given DPI and WIDGET SIZE.
+fn widget_width_at(dpi: u32, widget_size: u32) -> i32 {
+    scale_px(WIDGET_W, dpi, widget_size)
 }
 
 fn total_widget_width() -> i32 {
-    let active_models = {
-        let state = lock_state();
-        state
-            .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or(1)
-    };
-    total_widget_width_for(active_models)
+    widget_width_at(
+        CURRENT_DPI.load(Ordering::Relaxed),
+        WIDGET_SIZE.load(Ordering::Relaxed),
+    )
 }
 
 fn claude_accent_color() -> Color {
@@ -1534,38 +1464,8 @@ fn claude_led() -> Led {
     }
 }
 
-/// Codex bars: a mono LED, bright on dark and dark on light so it stays legible
-/// in either taskbar theme.
-fn codex_led(is_dark: bool) -> Led {
-    if is_dark {
-        Led {
-            edge: Color::from_hex("#6B7280"),
-            mid: Color::from_hex("#E5E7EB"),
-            core: Color::from_hex("#FFFFFF"),
-            glow: Color::from_hex("#D1D5DB"),
-        }
-    } else {
-        Led {
-            edge: Color::from_hex("#9CA3AF"),
-            mid: Color::from_hex("#4B5563"),
-            core: Color::from_hex("#111827"),
-            glow: Color::from_hex("#6B7280"),
-        }
-    }
-}
-
-/// Antigravity bars: a blue LED that keeps that model's identity.
-fn antigravity_led() -> Led {
-    Led {
-        edge: Color::from_hex("#1E3A8A"),
-        mid: Color::from_hex("#4285F4"),
-        core: Color::from_hex("#E8F0FF"),
-        glow: Color::from_hex("#60A5FA"),
-    }
-}
-
-/// The device-RAM ring: an emerald, kept distinct from the cyan model bars so
-/// RAM still reads as its own kind of metric.
+/// The device rings: an emerald, kept distinct from the cyan usage rings so
+/// CPU and RAM still read as their own kind of metric.
 fn ring_led() -> Led {
     Led {
         edge: Color::from_hex("#047857"),
@@ -1617,10 +1517,10 @@ fn state_led(percent: f64, burn: f64, base: &Led) -> Led {
     }
 }
 
-/// RAM warms continuously rather than in steps, so the colour itself reads as
-/// headroom: emerald while there is room, amber as it tightens, red as the
-/// machine approaches swapping.
-fn ram_led(percent: f64) -> Led {
+/// CPU and RAM warm continuously rather than in steps, so the colour itself
+/// reads as headroom: emerald while there is room, amber as it tightens, red as
+/// the machine runs out.
+fn load_led(percent: f64) -> Led {
     let ring = ring_led();
     if percent <= 60.0 {
         ring
@@ -1632,15 +1532,6 @@ fn ram_led(percent: f64) -> Led {
             &hot_led(),
             ((percent - 85.0) / 15.0).clamp(0.0, 1.0),
         )
-    }
-}
-
-/// Track colour for the unfilled part of the RAM ring.
-fn ram_track_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#2F3B45")
-    } else {
-        Color::from_hex("#C7D2DA")
     }
 }
 
@@ -1683,13 +1574,12 @@ fn anim_breath() -> f64 {
 /// The displayed figures ease toward whatever the poller last reported, so a
 /// new reading reads as a change rather than appearing to have always been
 /// there. `flash` decays after each poll, `text_tick` fires when a countdown
-/// digit rolls over, and `ram` eases toward the last sample so a steady machine
-/// still drifts. All of it is driven off the existing 33ms animation timer.
+/// digit rolls over, and `cpu` and `ram` ease toward the last sample so a
+/// steady machine still drifts. All of it is driven off the animation timer.
 struct LiveAnim {
     shown: [f64; 7],
+    cpu: f64,
     ram: f64,
-    ram_lo: f64,
-    ram_hi: f64,
     flash: f64,
     text_tick: f64,
     last_texts: [String; 7],
@@ -1700,9 +1590,8 @@ struct LiveAnim {
 #[derive(Clone, Copy)]
 struct LiveFrame {
     shown: [f64; 7],
+    cpu: f64,
     ram: f64,
-    ram_lo: f64,
-    ram_hi: f64,
     flash: f64,
     text_tick: f64,
     poll_frac: f64,
@@ -1714,6 +1603,7 @@ static LIVE_ANIM: Mutex<Option<LiveAnim>> = Mutex::new(None);
 fn step_anim(
     targets: &[f64; 7],
     texts: &[&str; 7],
+    cpu_target: f64,
     ram_target: f64,
     poll_interval_ms: u32,
 ) -> LiveFrame {
@@ -1721,9 +1611,8 @@ fn step_anim(
     let now = Instant::now();
     let anim = guard.get_or_insert_with(|| LiveAnim {
         shown: *targets,
+        cpu: cpu_target,
         ram: ram_target,
-        ram_lo: ram_target,
-        ram_hi: ram_target,
         flash: 0.0,
         text_tick: 0.0,
         last_texts: std::array::from_fn(|_| String::new()),
@@ -1753,14 +1642,8 @@ fn step_anim(
     }
 
     let rk = 1.0 - (-dt / 0.45).exp();
+    anim.cpu += (cpu_target - anim.cpu) * rk;
     anim.ram += (ram_target - anim.ram) * rk;
-    // A decaying envelope rather than a true window: cheap, and it tracks
-    // roughly the last minute of movement.
-    anim.ram_lo = anim.ram_lo.min(anim.ram);
-    anim.ram_hi = anim.ram_hi.max(anim.ram);
-    let relax = (dt * 0.04).min(1.0);
-    anim.ram_lo += (anim.ram - anim.ram_lo) * relax;
-    anim.ram_hi += (anim.ram - anim.ram_hi) * relax;
 
     for i in 0..7 {
         if anim.last_texts[i] != texts[i] {
@@ -1788,9 +1671,8 @@ fn step_anim(
 
     LiveFrame {
         shown: anim.shown,
+        cpu: anim.cpu,
         ram: anim.ram,
-        ram_lo: anim.ram_lo,
-        ram_hi: anim.ram_hi,
         flash: anim.flash,
         text_tick: anim.text_tick,
         poll_frac,
@@ -1885,18 +1767,10 @@ pub fn run() {
         }
         let install_channel = updater::current_install_channel();
         // Before the window is created, so its very first size is right.
-        WIDGET_SIZE.store(
-            settings.appearance.clamped_widget_size(),
-            Ordering::Relaxed,
-        );
+        WIDGET_SIZE.store(settings.appearance.clamped_widget_size(), Ordering::Relaxed);
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(localization::STRINGS.window_title);
-        let initial_model_count = active_model_count(
-            settings.show_claude_code,
-            settings.show_codex,
-            settings.show_antigravity,
-        );
         // NOACTIVATE stops the widget taking focus but it still hit-tests, so
         // it swallows clicks on whatever it covers. TRANSPARENT is what
         // actually passes them through (see the click_through doc comment).
@@ -1912,7 +1786,7 @@ pub fn run() {
             WS_POPUP,
             0,
             0,
-            total_widget_width_for(initial_model_count),
+            total_widget_width(),
             widget_sc(WIDGET_HEIGHT),
             HWND::default(),
             HMENU::default(),
@@ -2143,7 +2017,6 @@ fn render_layered() {
         session_pct,
         session_pace,
         weekly_pace,
-        week,
         session_text,
         weekly_pct,
         weekly_text,
@@ -2171,7 +2044,6 @@ fn render_layered() {
                     s.session_percent,
                     session_pace,
                     weekly_pace,
-                    week_markers(s.data.as_ref()),
                     s.session_text.clone(),
                     s.weekly_percent,
                     s.weekly_text.clone(),
@@ -2260,7 +2132,6 @@ fn render_layered() {
             &accent,
             &track,
             strings,
-            week,
             session_pct,
             session_pace,
             &session_text,
@@ -2340,7 +2211,6 @@ fn paint_content(
     accent: &Color,
     track: &Color,
     strings: Strings,
-    week: WeekMarkers,
     session_pct: f64,
     session_pace: Option<f64>,
     session_text: &str,
@@ -2370,29 +2240,16 @@ fn paint_content(
             .unwrap_or(POLL_1_MIN)
     };
 
-    // The bar-era accents and the row-label strings drive nothing now that the
-    // rows are figures; the paint entrypoints still compute and pass them.
+    // The widget shows one provider's 5h and 7d windows and the device rings.
+    // The bar-era accents, the other providers, the Fable row and the day band
+    // drive nothing any more; the paint entrypoints still compute and pass them.
     let _ = (accent, codex_accent, antigravity_accent, track);
+    let _ = (show_claude_code, show_codex, show_antigravity);
 
     let breath = anim_breath();
     let appearance = appearance();
     let palette = appearance.palette(is_dark);
     let custom = appearance.mode == Mode::Custom;
-    // Name every provider, even in single-provider mode: colour alone isn't identity.
-    let labels = {
-        let state = lock_state();
-        let data = state.as_ref().and_then(|s| s.data.as_ref());
-        let codex = data.and_then(|d| d.codex.as_ref());
-        [
-            strings.session_window.to_owned(),
-            strings.weekly_window.to_owned(),
-            readout::window_label(codex.map(|d| &d.session), "5h"),
-            readout::window_label(codex.map(|d| &d.weekly), "7d"),
-            "Quota".to_owned(),
-            "Extra".to_owned(),
-            "Fable".to_owned(),
-        ]
-    };
 
     let targets = [
         session_pct,
@@ -2412,7 +2269,13 @@ fn paint_content(
         antigravity_weekly_text,
         fable.1.as_str(),
     ];
-    let frame = step_anim(&targets, &texts, last_ram_sample(), poll_interval_ms);
+    let frame = step_anim(
+        &targets,
+        &texts,
+        last_cpu_sample(),
+        last_ram_sample(),
+        poll_interval_ms,
+    );
 
     unsafe {
         let client_rect = RECT {
@@ -2460,166 +2323,172 @@ fn paint_content(
 
         let _ = SetBkMode(hdc, TRANSPARENT);
 
-        draw_ram_column(
-            hdc,
-            widget_sc(RAM_X),
-            frame.ram,
-            frame.ram_lo,
-            frame.ram_hi,
-            is_dark,
-            bg,
-            breath,
-        );
+        let ink = palette[1];
+        let label_ink = blend(*bg, ink, 0.65);
+        let ring_track = blend(*bg, ink, 0.14);
+        let lift = if is_dark {
+            Color::from_hex("#FFFFFF")
+        } else {
+            Color::from_hex("#000000")
+        };
+        // The figure, flashed toward the state's core colour for a beat after a
+        // reading lands so the change is what draws the eye, not the motion.
+        let figure_ink = |led: &Led, flash: f64| {
+            if custom {
+                ink
+            } else if is_dark {
+                blend(ink, led.core, 0.30 + 0.60 * flash)
+            } else {
+                blend(ink, led.edge, 0.45 + 0.40 * flash)
+            }
+        };
+        let stroke = widget_sc(RING_STROKE) as f64;
+        let gap = widget_sc(RING_GAP) as f64;
+        let ring_d = widget_sc(RING_D);
 
         let figure_font = make_font(-12, FW_SEMIBOLD);
         let time_font = make_font(-10, FW_MEDIUM);
-        let day_font = make_font(-9, FW_SEMIBOLD);
-        let day_font_bold = make_font(-9, FW_BOLD);
+        let label_font = make_font(-9, FW_SEMIBOLD);
         let old_font = SelectObject(hdc, figure_font);
 
-        let providers = [
-            (
-                show_claude_code,
-                claude_led(),
-                0usize,
-                palette[2],
-                week.claude,
-            ),
-            (
-                show_codex,
-                codex_led(is_dark),
-                2usize,
-                palette[3],
-                week.codex,
-            ),
-            (
-                show_antigravity,
-                antigravity_led(),
-                4usize,
-                palette[4],
-                week.antigravity,
-            ),
-        ];
-
-        let mut x = widget_sc(CONTENT_X);
-        for (visible, base, idx, ident_color, _blocks) in providers {
-            if !visible {
-                continue;
+        // Usage: the five-hour window on the outer ring, the weekly one inside.
+        let base = if custom {
+            let ident = palette[2];
+            Led {
+                edge: blend(ident, *bg, 0.4),
+                mid: ident,
+                core: blend(ident, Color::new(255, 255, 255), 0.25),
+                glow: ident,
             }
-            let tx = x + widget_sc(LABEL_W);
-            let ink = palette[1];
-            let base = if custom {
-                Led {
-                    edge: blend(ident_color, *bg, 0.4),
-                    mid: ident_color,
-                    core: blend(ident_color, Color::new(255, 255, 255), 0.25),
-                    glow: ident_color,
-                }
-            } else {
-                base
+        } else {
+            claude_led()
+        };
+        let usage = [
+            (0usize, strings.session_window, session_pace, ROW1_Y),
+            (1usize, strings.weekly_window, weekly_pace, ROW2_Y),
+        ];
+        let usage_bands = usage.map(|(slot, label, pace, row_y)| {
+            let pct = frame.shown[slot].clamp(0.0, 100.0);
+            let reading = readout::has_reading(texts[slot]);
+            let burn = pace.map(|p| pct - p).unwrap_or(0.0);
+            let led = state_led(pct, burn, &base);
+            let row = RingRow {
+                y: row_y,
+                label,
+                figure: readout::figure(pct, texts[slot]),
+                figure_color: figure_ink(&led, frame.flash),
+                reset: Some((
+                    readout::reset_label(texts[slot]),
+                    blend(ink, lift, 0.55 * frame.text_tick),
+                )),
             };
-            let card = blend(*bg, ident_color, if is_dark { 0.06 } else { 0.035 });
-            draw_rounded_rect(
-                hdc,
-                &RECT {
-                    left: x,
-                    top: widget_sc(1),
-                    right: x + widget_sc(PROVIDER_W),
-                    bottom: height - widget_sc(1),
-                },
-                &card,
-                widget_sc(4),
-            );
-            fill_box(hdc, x + widget_sc(6), widget_sc(5), widget_sc(3), widget_sc(3), &ident_color);
-            // No provider name: the card's accent color identifies the provider.
-            SelectObject(hdc, day_font);
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: x + widget_sc(86),
-                    top: widget_sc(1),
-                    right: x + widget_sc(PROVIDER_W - 8),
-                    bottom: widget_sc(12),
-                },
-                "USED / RESET IN",
-                &blend(card, ink, 0.65),
-                DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
-            );
+            let band = RingBand {
+                percent: if reading { pct } else { 0.0 },
+                fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
+                track: ring_track,
+                tick: pace
+                    .filter(|_| reading)
+                    .map(|p| (p, blend(pace_marker_color(is_dark), *bg, 0.35))),
+            };
+            (band, row)
+        });
 
-            let rows = [
-                (
-                    widget_sc(ROW1_Y),
-                    idx,
-                    if idx == 0 { session_pace } else { None },
-                    None,
-                ),
-                (
-                    widget_sc(ROW2_Y),
-                    idx + 1,
-                    if idx == 0 { weekly_pace } else { None },
-                    None,
-                ),
-            ];
-            let rows = rows.into_iter().chain(
-                (idx == 0).then_some((widget_sc(45), 6, None, None)),
+        // The device: CPU on the outer ring, RAM inside it.
+        let system = [("CPU", frame.cpu, ROW1_Y), ("RAM", frame.ram, ROW2_Y)];
+        let system_bands = system.map(|(label, value, row_y)| {
+            let value = value.clamp(0.0, 100.0);
+            let led = load_led(value);
+            let row = RingRow {
+                y: row_y,
+                label,
+                figure: format!("{value:.0}%"),
+                figure_color: figure_ink(&led, 0.0),
+                reset: None,
+            };
+            let band = RingBand {
+                percent: value,
+                fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
+                track: ring_track,
+                tick: None,
+            };
+            (band, row)
+        });
+
+        for (ring_x, bands) in [(USAGE_X, &usage_bands), (SYSTEM_X, &system_bands)] {
+            let x = widget_sc(ring_x);
+            draw_rings(
+                hdc,
+                x,
+                widget_sc(RING_Y),
+                ring_d,
+                stroke,
+                gap,
+                [&bands[0].0, &bands[1].0],
+                *bg,
             );
-            for (row_y, slot, pace, week_blocks) in rows {
-                // Codex displays only its general weekly quota, not Spark's 5h limit.
-                if idx == 2 && slot == idx {
-                    continue;
-                }
-                let row_y = if idx == 2 {
-                    widget_sc((ROW1_Y + ROW2_Y) / 2)
-                } else {
-                    row_y
-                };
-                SelectObject(hdc, day_font);
+            let tx = x + widget_sc(TEXT_DX);
+            for (_, row) in bands.iter() {
+                let top = widget_sc(row.y);
+                let bottom = top + widget_sc(ROW_H);
+                SelectObject(hdc, label_font);
                 draw_text_in(
                     hdc,
                     RECT {
-                        left: x + widget_sc(6),
-                        top: row_y,
-                        right: tx - widget_sc(3),
-                        bottom: row_y + widget_sc(ROW_H),
+                        left: tx,
+                        top,
+                        right: tx + widget_sc(LABEL_W),
+                        bottom,
                     },
-                    &labels[slot],
-                    &blend(card, ink, 0.65),
+                    row.label,
+                    &label_ink,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
-                draw_numeric_row(
+                let fx = tx + widget_sc(LABEL_W);
+                SelectObject(hdc, figure_font);
+                draw_text_in(
                     hdc,
-                    &RowDraw {
-                        x: tx,
-                        y: row_y,
-                        shown: frame.shown[slot],
-                        pace,
-                        time_text: texts[slot],
-                        base,
-                        week: week_blocks,
-                        weekdays: &strings.weekday_initials,
-                        is_dark,
-                        bg: card,
-                        track: blend(card, ink, 0.14),
-                        ink,
-                        custom_ink: custom,
-                        breath,
-                        flash: frame.flash,
-                        text_tick: frame.text_tick,
+                    RECT {
+                        left: fx,
+                        top,
+                        right: fx + widget_sc(FIGURE_W),
+                        bottom,
                     },
-                    figure_font,
-                    time_font,
-                    day_font,
-                    day_font_bold,
+                    &row.figure,
+                    &row.figure_color,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
+                if let Some((reset, color)) = row.reset {
+                    let rx = fx + widget_sc(FIGURE_W);
+                    SelectObject(hdc, time_font);
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: rx,
+                            top,
+                            right: rx + widget_sc(RESET_W),
+                            bottom,
+                        },
+                        reset,
+                        &color,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
             }
-            x += provider_slot_width();
         }
+
+        fill_box(
+            hdc,
+            widget_sc(SPLIT_X),
+            widget_sc(SPLIT_Y),
+            widget_sc(1).max(1),
+            widget_sc(SPLIT_H),
+            &blend(*bg, ink, 0.12),
+        );
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(figure_font);
         let _ = DeleteObject(time_font);
-        let _ = DeleteObject(day_font);
-        let _ = DeleteObject(day_font_bold);
+        let _ = DeleteObject(label_font);
 
         // Poll freshness: a hairline along the top edge that fills over the poll
         // interval and restarts when a reading lands. It is always moving, it
@@ -2627,7 +2496,7 @@ fn paint_content(
         // row a moment before the count-up fires. It sits at the top because
         // the bottom of the widget belongs to the day band.
         let thin = widget_sc(1).max(1);
-        let x0 = widget_sc(CONTENT_X);
+        let x0 = widget_sc(USAGE_X);
         let x1 = width - thin;
         if x1 > x0 {
             let y = 0;
@@ -3211,20 +3080,35 @@ mod desktop_tests {
     fn single_monitor_keeps_the_widget_inside_and_pulls_it_back_from_each_edge() {
         let works = [work(0, 0, 1920, 1040)];
         assert_eq!(keep_widget_on_screen(300, 200, 384, 46, &works), (300, 200));
-        assert_eq!(keep_widget_on_screen(1536, 994, 384, 46, &works), (1536, 994));
+        assert_eq!(
+            keep_widget_on_screen(1536, 994, 384, 46, &works),
+            (1536, 994)
+        );
         assert_eq!(keep_widget_on_screen(-50, 200, 384, 46, &works), (0, 200));
-        assert_eq!(keep_widget_on_screen(1700, 200, 384, 46, &works), (1536, 200));
+        assert_eq!(
+            keep_widget_on_screen(1700, 200, 384, 46, &works),
+            (1536, 200)
+        );
         assert_eq!(keep_widget_on_screen(300, -20, 384, 46, &works), (300, 0));
-        assert_eq!(keep_widget_on_screen(300, 1020, 384, 46, &works), (300, 994));
+        assert_eq!(
+            keep_widget_on_screen(300, 1020, 384, 46, &works),
+            (300, 994)
+        );
         assert_eq!(keep_widget_on_screen(-90, -90, 384, 46, &works), (0, 0));
     }
 
     #[test]
     fn widget_may_straddle_side_by_side_monitors_but_not_leave_the_top() {
         let works = [work(0, 0, 1920, 1040), work(1920, 0, 3840, 1040)];
-        assert_eq!(keep_widget_on_screen(1800, 300, 384, 46, &works), (1800, 300));
+        assert_eq!(
+            keep_widget_on_screen(1800, 300, 384, 46, &works),
+            (1800, 300)
+        );
         assert_eq!(keep_widget_on_screen(1800, -30, 384, 46, &works), (1800, 0));
-        assert_eq!(keep_widget_on_screen(1000, -10, 2500, 46, &works), (1000, 0));
+        assert_eq!(
+            keep_widget_on_screen(1000, -10, 2500, 46, &works),
+            (1000, 0)
+        );
     }
 
     #[test]
@@ -3242,12 +3126,18 @@ mod desktop_tests {
     fn widget_larger_than_every_monitor_is_top_left_aligned_in_the_nearest() {
         let works = [work(0, 0, 1920, 1040), work(1920, 0, 3840, 1040)];
         assert_eq!(keep_widget_on_screen(100, 100, 2500, 1200, &works), (0, 0));
-        assert_eq!(keep_widget_on_screen(3000, 500, 2500, 1200, &works), (1920, 0));
+        assert_eq!(
+            keep_widget_on_screen(3000, 500, 2500, 1200, &works),
+            (1920, 0)
+        );
     }
 
     #[test]
     fn no_monitors_leaves_the_proposal_alone() {
-        assert_eq!(keep_widget_on_screen(5000, 5000, 384, 46, &[]), (5000, 5000));
+        assert_eq!(
+            keep_widget_on_screen(5000, 5000, 384, 46, &[]),
+            (5000, 5000)
+        );
     }
 
     #[test]
@@ -3255,9 +3145,9 @@ mod desktop_tests {
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 100), 62);
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 200), 124);
         assert_eq!(scale_px(WIDGET_HEIGHT, 144, 200), 186);
-        assert_eq!(widget_width_at(2, 96, 100), 384);
-        assert_eq!(widget_width_at(2, 96, 200), 768);
-        assert_eq!(widget_width_at(1, 192, 100), widget_width_at(1, 96, 200));
+        assert_eq!(widget_width_at(96, 100), 310);
+        assert_eq!(widget_width_at(96, 200), 620);
+        assert_eq!(widget_width_at(192, 100), widget_width_at(96, 200));
     }
 
     #[test]
@@ -3274,8 +3164,22 @@ mod desktop_tests {
     }
 
     #[test]
+    fn saved_provider_choices_load_as_claude_code_only() {
+        let mut settings: SettingsFile = serde_json::from_str(
+            r#"{"show_claude_code":false,"show_codex":true,"show_antigravity":true}"#,
+        )
+        .unwrap();
+        show_only_claude_code(&mut settings);
+        assert!(settings.show_claude_code);
+        assert!(!settings.show_codex && !settings.show_antigravity);
+    }
+
+    #[test]
     fn old_settings_with_a_language_key_still_load_and_drop_it_on_save() {
-        let settings: SettingsFile = serde_json::from_str(r#"{"poll_interval_ms":60000,"language":"de","show_codex":false}"#).unwrap();
+        let settings: SettingsFile = serde_json::from_str(
+            r#"{"poll_interval_ms":60000,"language":"de","show_codex":false}"#,
+        )
+        .unwrap();
         assert_eq!(settings.poll_interval_ms, 60000);
         assert!(!settings.show_codex);
         let saved = serde_json::to_string(&settings).unwrap();
@@ -3293,11 +3197,7 @@ fn position_floating_widget() {
         if s.dragging {
             return;
         }
-        (
-            s.hwnd.to_hwnd(),
-            s.floating_position,
-            total_widget_width_for_state(s),
-        )
+        (s.hwnd.to_hwnd(), s.floating_position, total_widget_width())
     };
     let height = widget_sc(WIDGET_HEIGHT);
     unsafe {
@@ -3362,7 +3262,9 @@ unsafe extern "system" fn on_foreground_changed(
     let target = {
         let state = lock_state();
         match state.as_ref() {
-            Some(s) if !s.embedded && s.widget_visible => Some(s.hwnd.to_hwnd()),
+            Some(s) if !s.embedded && s.widget_visible && !MENU_OPEN.load(Ordering::Relaxed) => {
+                Some(s.hwnd.to_hwnd())
+            }
             _ => None,
         }
     };
@@ -3513,6 +3415,7 @@ unsafe extern "system" fn wnd_proc(
                         state.as_ref().map(|s| s.widget_visible).unwrap_or(false)
                     };
                     if visible {
+                        sample_cpu();
                         sample_ram();
                     }
                 }
@@ -3551,7 +3454,13 @@ unsafe extern "system" fn wnd_proc(
                     let target = {
                         let state = lock_state();
                         match state.as_ref() {
-                            Some(s) if !s.embedded && s.widget_visible => Some(s.hwnd.to_hwnd()),
+                            Some(s)
+                                if !s.embedded
+                                    && s.widget_visible
+                                    && !MENU_OPEN.load(Ordering::Relaxed) =>
+                            {
+                                Some(s.hwnd.to_hwnd())
+                            }
                             _ => None,
                         }
                     };
@@ -3750,7 +3659,7 @@ unsafe extern "system" fn wnd_proc(
                                     tray_left = tray_rect.left;
                                 }
                             }
-                            let widget_width = total_widget_width_for_state(s);
+                            let widget_width = total_widget_width();
                             let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
                                 new_offset = max_offset;
@@ -3958,45 +3867,6 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
-                    {
-                        let mut state = lock_state();
-                        if let Some(s) = state.as_mut() {
-                            match id {
-                                IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
-                                }
-                                IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
-                                }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
-                                }
-                                _ => {}
-                            }
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
-                        }
-                    }
-                    save_state_settings();
-                    position_at_taskbar();
-                    render_layered();
-                    sync_tray_icons(hwnd);
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
-                }
                 id if id == tray_icon::IDM_TOGGLE_WIDGET => {
                     toggle_widget_visibility(hwnd);
                 }
@@ -4043,15 +3913,7 @@ unsafe extern "system" fn wnd_proc(
 fn show_context_menu(hwnd: HWND) {
     unsafe {
         let strings = localization::STRINGS;
-        let (
-            current_interval,
-            install_channel,
-            update_status,
-            widget_visible,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-        ) = {
+        let (current_interval, install_channel, update_status, widget_visible) = {
             let state = lock_state();
             match state.as_ref() {
                 Some(s) => (
@@ -4059,18 +3921,12 @@ fn show_context_menu(hwnd: HWND) {
                     s.install_channel,
                     s.update_status.clone(),
                     s.widget_visible,
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
                 ),
                 None => (
                     POLL_15_MIN,
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
-                    true,
-                    false,
-                    false,
                 ),
             }
         };
@@ -4122,55 +3978,6 @@ fn show_context_menu(hwnd: HWND) {
             MF_POPUP,
             freq_menu.0 as usize,
             PCWSTR::from_raw(freq_label.as_ptr()),
-        );
-
-        // Models submenu
-        let models_menu = CreatePopupMenu().unwrap();
-        let claude_model = native_interop::wide_str(strings.claude_code_model);
-        let claude_flags = if show_claude_code {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            claude_flags,
-            IDM_MODEL_CLAUDE_CODE as usize,
-            PCWSTR::from_raw(claude_model.as_ptr()),
-        );
-
-        let codex_model = native_interop::wide_str(strings.codex_model);
-        let codex_flags = if show_codex {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            codex_flags,
-            IDM_MODEL_CODEX as usize,
-            PCWSTR::from_raw(codex_model.as_ptr()),
-        );
-
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
-        );
-
-        let models_label = native_interop::wide_str(strings.models);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            models_menu.0 as usize,
-            PCWSTR::from_raw(models_label.as_ptr()),
         );
 
         // Settings submenu
@@ -4249,8 +4056,13 @@ fn show_context_menu(hwnd: HWND) {
 
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
+        // The menu is a topmost window too, so re-asserting the widget's
+        // topmost place while it is open would lift the widget over the menu
+        // and hide the items it overlaps. Hold the re-assert until it closes.
+        MENU_OPEN.store(true, Ordering::Relaxed);
         let _ = SetForegroundWindow(hwnd);
         let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+        MENU_OPEN.store(false, Ordering::Relaxed);
         let _ = DestroyMenu(menu);
     }
 }
@@ -4263,7 +4075,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
         session_pct,
         session_pace,
         weekly_pace,
-        week,
         session_text,
         weekly_pct,
         weekly_text,
@@ -4289,7 +4100,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
                     s.session_percent,
                     session_pace,
                     weekly_pace,
-                    week_markers(s.data.as_ref()),
                     s.session_text.clone(),
                     s.weekly_percent,
                     s.weekly_text.clone(),
@@ -4346,7 +4156,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &accent,
             &track,
             strings,
-            week,
             session_pct,
             session_pace,
             &session_text,
@@ -4444,269 +4253,132 @@ pub(crate) fn draw_text_in(
     }
 }
 
-/// The device-RAM column.
-///
-/// The fill ramps across the column's width, not down its height. That is the
-/// one place this differs from the old bar treatment, and it matters: the LED
-/// ramp runs its bright `mid` stop to its dark `edge` stop over the fill's
-/// height, which on a 28px column lays the dark end along the bottom, where it
-/// sat barely above the track and the level became unreadable. Ramping across
-/// five pixels instead keeps every row of the fill lit.
-fn draw_ram_column(
-    hdc: HDC,
-    x: i32,
+/// One band of a ring gauge: how full it is, its colours, and an optional pace
+/// tick across the band at the percentage an even spend would have reached.
+struct RingBand {
     percent: f64,
-    lo: f64,
-    hi: f64,
-    is_dark: bool,
-    bg: &Color,
-    breath: f64,
-) {
-    let percent = percent.clamp(0.0, 100.0);
-    let led = ram_led(percent);
-    let track = ram_track_color(is_dark);
-    let w = widget_sc(RAM_W).max(3);
-    let h = widget_sc(RAM_H);
-    let y = widget_sc(RAM_Y);
-    let radius = w / 2;
-    let fill_h = ((h as f64) * percent / 100.0).round() as i32;
-
-    unsafe {
-        if breath > 0.02 && fill_h > 0 {
-            for i in (1..=2).rev() {
-                let grow = widget_sc(i);
-                let a = 0.18 * breath * (1.0 - (i as f64 - 1.0) / 2.0);
-                let rect = RECT {
-                    left: x - grow,
-                    top: y + h - fill_h - grow,
-                    right: x + w + grow,
-                    bottom: y + h + grow,
-                };
-                draw_rounded_rect(hdc, &rect, &blend(*bg, led.glow, a), radius + grow);
-            }
-        }
-
-        let track_rect = RECT {
-            left: x,
-            top: y,
-            right: x + w,
-            bottom: y + h,
-        };
-        draw_rounded_rect(hdc, &track_rect, &track, radius);
-
-        if fill_h > 0 {
-            let fy = y + h - fill_h;
-            let rgn = CreateRoundRectRgn(x, fy, x + w + 1, y + h + 1, radius * 2, radius * 2);
-            let _ = SelectClipRgn(hdc, rgn);
-
-            let centre = blend(led.mid, led.core, 0.10 + 0.30 * breath);
-            let flank = blend(centre, led.edge, 0.50);
-            let half = (((w - 1) as f64) / 2.0).max(1.0);
-            for c in 0..w {
-                let t = ((c as f64 - ((w - 1) as f64) / 2.0) / half)
-                    .abs()
-                    .clamp(0.0, 1.0);
-                fill_box(hdc, x + c, fy, 1, fill_h, &blend(centre, flank, t));
-            }
-
-            let _ = SelectClipRgn(hdc, HRGN::default());
-            let _ = DeleteObject(rgn);
-
-            // Bright cap riding the head, so the level is findable at a glance
-            // however dark the body of the fill has gone.
-            let cap = blend(led.core, led.glow, 0.20 + 0.40 * breath);
-            fill_box(hdc, x, fy, w, widget_sc(1).max(1), &cap);
-        }
-
-        // The range the reading has been moving through, as two ticks beside
-        // the column so they cannot be read as part of the level itself.
-        let tick = blend(*bg, led.mid, 0.45);
-        let thin = widget_sc(1).max(1);
-        for v in [lo, hi] {
-            let ty = y + h - ((h as f64) * v.clamp(0.0, 100.0) / 100.0).round() as i32;
-            fill_box(hdc, x - widget_sc(2), ty, thin, thin, &tick);
-        }
-    }
+    fill: Color,
+    track: Color,
+    tick: Option<(f64, Color)>,
 }
 
-/// Everything one usage row needs. Two of these per provider: the five-hour
-/// window, then the weekly one, which also carries the day band.
-struct RowDraw<'a> {
-    custom_ink: bool,
+/// The figures beside a ring, one row per band: a label, the percentage, and
+/// on usage rows the time to reset.
+struct RingRow<'a> {
+    y: i32,
+    label: &'a str,
+    figure: String,
+    figure_color: Color,
+    reset: Option<(&'a str, Color)>,
+}
+
+/// Pixel coverage for a distance inside an edge, ramped over one pixel.
+fn coverage(inside: f64) -> f64 {
+    (inside + 0.5).clamp(0.0, 1.0)
+}
+
+/// Two concentric ring gauges in a `d`-pixel square at (x, y), outer band
+/// first, each filling clockwise from twelve o'clock with round caps.
+///
+/// GDI's arcs are not anti-aliased, so the rings are rasterised here with
+/// per-pixel coverage and blitted in one go. Everything is blended onto the
+/// opaque `bg`, which is the same fake translucency `blend` documents, so the
+/// layered window's background key still sees only `bg` outside the bands.
+fn draw_rings(
+    hdc: HDC,
     x: i32,
     y: i32,
-    shown: f64,
-    pace: Option<f64>,
-    time_text: &'a str,
-    base: Led,
-    week: Option<WeekBlocks>,
-    weekdays: &'a [&'static str; 7],
-    is_dark: bool,
+    d: i32,
+    stroke: f64,
+    gap: f64,
+    bands: [&RingBand; 2],
     bg: Color,
-    track: Color,
-    ink: Color,
-    breath: f64,
-    flash: f64,
-    text_tick: f64,
-}
-
-/// One usage row: the percentage, the time to reset, a hairline gauge, and -
-/// on the weekly row - the seven weekday initials.
-///
-/// The only thing here that breathes continuously is the ember on the fill
-/// head, and the only thing that breathes loudly is the overdraft. A row that
-/// is under pace and not yet high sits almost still, which is what makes the
-/// loud state worth looking at.
-fn draw_numeric_row(
-    hdc: HDC,
-    o: &RowDraw,
-    figure_font: HFONT,
-    time_font: HFONT,
-    day_font: HFONT,
-    day_font_bold: HFONT,
 ) {
-    let pct = o.shown.clamp(0.0, 100.0);
-    let burn = o.pace.map(|p| pct - p).unwrap_or(0.0);
-    let led = state_led(pct, burn, &o.base);
-    let rule_w = widget_sc(RULE_W);
-    let ry = o.y + widget_sc(RULE_DY);
-    let thin = widget_sc(1).max(1);
-    let fill_x = ((rule_w as f64) * pct / 100.0).round() as i32;
-
+    if d <= 0 {
+        return;
+    }
+    let tau = std::f64::consts::TAU;
+    let c = d as f64 / 2.0;
+    let half = stroke / 2.0;
+    // Per band, outer first: its centre-line radius, how far round it fills,
+    // where the fill's end cap sits, and the pace tick's direction.
+    let mids = [c - half, c - half - stroke - gap];
+    let geometry = [0, 1].map(|i| {
+        let mid = mids[i];
+        let sweep = bands[i].percent.clamp(0.0, 100.0) / 100.0 * tau;
+        let end_cap = (mid * sweep.sin(), -mid * sweep.cos());
+        let tick = bands[i].tick.map(|(pace, color)| {
+            let a = pace.clamp(0.0, 100.0) / 100.0 * tau;
+            (a.sin(), -a.cos(), color)
+        });
+        (mid, sweep, end_cap, tick)
+    });
+    // Nothing is drawn inside the inner band or outside the outer one.
+    let inner_edge = geometry[1].0 - half - 2.0;
+    let mut pixels = vec![0u32; (d * d) as usize];
+    for py in 0..d {
+        for px in 0..d {
+            let dx = px as f64 + 0.5 - c;
+            let dy = py as f64 + 0.5 - c;
+            let dist = dx.hypot(dy);
+            let mut color = bg;
+            if dist >= inner_edge && dist <= c + 1.0 {
+                // Clockwise from twelve o'clock, 0..TAU.
+                let angle = dx.atan2(-dy).rem_euclid(tau);
+                for (band, (mid, sweep, end_cap, tick)) in bands.iter().zip(geometry) {
+                    let off = (dist - mid).abs();
+                    color = blend(color, band.track, coverage(half - off));
+                    if sweep > 0.0 {
+                        let edge = if sweep >= tau || angle <= sweep {
+                            off
+                        } else {
+                            // Round caps: the distance to the band's centre
+                            // line at either end of the arc.
+                            let start = dx.hypot(dy + mid);
+                            let end = (dx - end_cap.0).hypot(dy - end_cap.1);
+                            start.min(end)
+                        };
+                        color = blend(color, band.fill, coverage(half - edge));
+                    }
+                    if let Some((ux, uy, tick)) = tick {
+                        let along = dx * ux + dy * uy;
+                        let across = (dx * uy - dy * ux).abs();
+                        let cov = coverage(stroke * 0.14 - across)
+                            * coverage(half + 1.0 - (along - mid).abs());
+                        color = blend(color, tick, cov);
+                    }
+                }
+            }
+            pixels[(py * d + px) as usize] =
+                (color.r as u32) << 16 | (color.g as u32) << 8 | color.b as u32;
+        }
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: d,
+            biHeight: -d,
+            biPlanes: 1,
+            biBitCount: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     unsafe {
-        // The figure, flashed toward the state's core colour for a beat after a
-        // reading lands so the change is what draws the eye, not the motion.
-        let figure = if o.custom_ink {
-            o.ink
-        } else if o.is_dark {
-            blend(o.ink, led.core, 0.30 + 0.60 * o.flash)
-        } else {
-            blend(o.ink, led.edge, 0.45 + 0.40 * o.flash)
-        };
-        SelectObject(hdc, figure_font);
-        draw_text_in(
+        SetDIBitsToDevice(
             hdc,
-            RECT {
-                left: o.x,
-                top: o.y,
-                right: o.x + widget_sc(FIGURE_W),
-                bottom: o.y + widget_sc(ROW_H),
-            },
-            &readout::figure(pct, o.time_text),
-            &figure,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            x,
+            y,
+            d as u32,
+            d as u32,
+            0,
+            0,
+            0,
+            d as u32,
+            pixels.as_ptr() as *const _,
+            &info,
+            DIB_RGB_COLORS,
         );
-
-        // The countdown, brightened for a beat whenever a digit rolls over.
-        let lift = if o.is_dark {
-            Color::from_hex("#FFFFFF")
-        } else {
-            Color::from_hex("#000000")
-        };
-        SelectObject(hdc, time_font);
-        draw_text_in(
-            hdc,
-            RECT {
-                left: o.x + widget_sc(TIME_DX),
-                top: o.y,
-                right: o.x + widget_sc(RULE_W),
-                bottom: o.y + widget_sc(ROW_H),
-            },
-            readout::reset_label(o.time_text),
-            &blend(o.ink, lift, 0.55 * o.text_tick),
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
-
-        // The hairline gauge.
-        fill_box(hdc, o.x, ry, rule_w, thin, &o.track);
-        if !readout::has_reading(o.time_text) {
-            return;
-        }
-        if fill_x > 0 {
-            fill_box(
-                hdc,
-                o.x,
-                ry,
-                fill_x,
-                thin,
-                &blend(led.mid, led.core, 0.10 + 0.25 * o.breath),
-            );
-        }
-
-        if let Some(pace) = o.pace {
-            let pace_x = ((rule_w as f64) * pace.clamp(0.0, 100.0) / 100.0).round() as i32;
-            // Overdraft: the stretch between where an even spend would have put
-            // you and where you actually are. Nothing else on the row breathes
-            // this hard, and it is absent entirely when you are under pace.
-            if burn > 0.5 && fill_x > pace_x {
-                let hot = hot_led();
-                fill_box(
-                    hdc,
-                    o.x + pace_x,
-                    ry - thin,
-                    fill_x - pace_x,
-                    thin * 3,
-                    &blend(hot.mid, hot.core, 0.15 + 0.45 * o.breath),
-                );
-            }
-            fill_box(
-                hdc,
-                o.x + pace_x,
-                ry - thin,
-                thin,
-                thin * 3,
-                &blend(pace_marker_color(o.is_dark), o.bg, 0.35),
-            );
-        }
-
-        // Ember on the fill head: low amplitude while there is nothing to act
-        // on, full amplitude once the state turns.
-        let loud = pct >= 70.0 || burn >= 8.0;
-        let amp = if loud {
-            0.45 + 0.55 * o.breath
-        } else {
-            0.18 + 0.30 * o.breath
-        };
-        fill_box(
-            hdc,
-            o.x + (fill_x - thin).max(0),
-            ry - thin,
-            thin * 2,
-            if loud { thin * 3 } else { thin * 2 },
-            &blend(o.bg, led.glow, amp),
-        );
-
-        // The day band. Seven initials under the weekly rule, the last of them
-        // the day the quota resets on; today is bold and lit, and breathes.
-        if let Some(week) = o.week {
-            let band_y = o.y + widget_sc(DAY_DY);
-            let band_h = widget_sc(DAY_BAND_H);
-            let quiet = blend(o.bg, o.ink, 0.72);
-            for d in 0..WEEKLY_BLOCKS {
-                let left = o.x + ((rule_w as f64) * d as f64 / WEEKLY_BLOCKS as f64).round() as i32;
-                let right =
-                    o.x + ((rule_w as f64) * (d + 1) as f64 / WEEKLY_BLOCKS as f64).round() as i32;
-                let is_today = week.today == Some(d as usize);
-                SelectObject(hdc, if is_today { day_font_bold } else { day_font });
-                let color = if is_today {
-                    blend(o.bg, led.glow, 0.60 + 0.40 * o.breath)
-                } else {
-                    quiet
-                };
-                draw_text_in(
-                    hdc,
-                    RECT {
-                        left,
-                        top: band_y,
-                        right,
-                        bottom: band_y + band_h,
-                    },
-                    o.weekdays[week.days[d as usize] % 7],
-                    &color,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
-            }
-        }
     }
 }
 
@@ -4715,7 +4387,8 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
     CURRENT_DPI.store(192, Ordering::Relaxed);
     WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
     RAM_SAMPLE.store(4200, Ordering::Relaxed);
-    let width = total_widget_width_for(2);
+    CPU_SAMPLE.store(1800, Ordering::Relaxed);
+    let width = total_widget_width();
     let height = widget_sc(WIDGET_HEIGHT);
     let bg = Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" });
     let ink = Color::from_hex(if dark { "#D7DEE6" } else { "#252B32" });
@@ -4752,7 +4425,6 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
             &claude_accent_color(),
             &track,
             localization::STRINGS,
-            week_markers(None),
             32.0,
             Some(45.0),
             "3h 12m",
