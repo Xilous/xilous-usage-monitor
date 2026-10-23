@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageSection {
     /// Missing quota data must never masquerade as an unused allowance.
     pub available: bool,
@@ -9,14 +9,14 @@ pub struct UsageSection {
     pub resets_at: Option<SystemTime>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageData {
     pub session: UsageSection,
     pub weekly: UsageSection,
     pub fable: UsageSection,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppUsageData {
     pub claude_code: Option<UsageData>,
     pub codex: Option<UsageData>,

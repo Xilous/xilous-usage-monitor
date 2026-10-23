@@ -23,9 +23,12 @@ which comes from the same usage request; no additional request is sent.
 - Percentages represent the account quota **used**, not remaining, token totals
   or dollar spend.
 - An em dash is unavailable data, never a fabricated 0%. `Offline` means the
-  provider failed; `Waiting` means loading/retrying; `Not reported` means that
-  quota window was absent. `Unknown` is an unavailable reset time with a valid
-  percentage.
+  sign-in needs attention; `Waiting` means no reading has landed yet;
+  `Not reported` means that quota window was absent. `Unknown` is an
+  unavailable reset time with a valid percentage.
+- A failed request keeps the last reading on screen while it retries; the
+  hairline along the top stays full until a new reading lands. The figures
+  flash only when a reading differs from the one shown.
 - The adapter never runs a CLI, sends a prompt, or refreshes tokens itself. It
   reads only the read-only usage endpoint. On an expired Claude sign-in, run
   `claude` and use `/login`, then **Refresh** from the tray.
