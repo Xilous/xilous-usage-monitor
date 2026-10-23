@@ -1679,12 +1679,20 @@ fn step_anim(
     }
 }
 
-/// A poll landed: the figures start moving to their new values and the
-/// freshness hairline restarts from the left.
-fn mark_poll() {
+/// What a poll hands `WM_APP_USAGE_UPDATED` in its wparam: whether a reading
+/// landed, and if so whether it differs from the one already on screen.
+const POLL_NO_READING: usize = 0;
+const POLL_UNCHANGED: usize = 1;
+const POLL_CHANGED: usize = 2;
+
+/// A poll landed: the freshness hairline restarts from the left, and when the
+/// reading changed the figures flash as they move to their new values.
+fn mark_poll(changed: bool) {
     let mut guard = LIVE_ANIM.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(anim) = guard.as_mut() {
-        anim.flash = 1.0;
+        if changed {
+            anim.flash = 1.0;
+        }
         anim.last_poll = Some(Instant::now());
     }
 }
@@ -2518,9 +2526,30 @@ fn do_poll(send_hwnd: SendHwnd) {
     };
 
     match poller::poll(show_claude_code, show_codex, show_antigravity) {
-        Ok(data) => {
+        Ok(mut data) => {
             let mut state = lock_state();
+            let mut landed = POLL_NO_READING;
             if let Some(s) = state.as_mut() {
+                // A provider whose request failed this round keeps its last
+                // reading rather than blanking while the others update.
+                let previous = s.data.take();
+                if let Some(previous) = previous.clone() {
+                    if s.show_claude_code && data.claude_code.is_none() {
+                        data.claude_code = previous.claude_code;
+                    }
+                    if s.show_codex && data.codex.is_none() {
+                        data.codex = previous.codex;
+                    }
+                    if s.show_antigravity && data.antigravity.is_none() {
+                        data.antigravity = previous.antigravity;
+                    }
+                }
+                landed = if s.last_poll_ok && previous.as_ref() == Some(&data) {
+                    POLL_UNCHANGED
+                } else {
+                    POLL_CHANGED
+                };
+
                 if let Some(claude_code) = data.claude_code.as_ref() {
                     s.session_percent = claude_code.session.percentage;
                     s.weekly_percent = claude_code.weekly.percentage;
@@ -2568,7 +2597,7 @@ fn do_poll(send_hwnd: SendHwnd) {
             }
 
             unsafe {
-                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(hwnd, WM_APP_USAGE_UPDATED, WPARAM(landed), LPARAM(0));
             }
         }
         Err(e) => {
@@ -2606,9 +2635,9 @@ fn do_poll(send_hwnd: SendHwnd) {
                 let mut state = lock_state();
                 let mut should_notify = false;
                 if let Some(s) = state.as_mut() {
-                    s.last_poll_ok = false;
                     match auth_watch {
                         Some((watch_mode, watch_snapshot)) => {
+                            s.last_poll_ok = false;
                             // Only show the balloon on the first failure so it doesn't spam.
                             if s.retry_count == 0 || s.force_notify_auth_error {
                                 should_notify = true;
@@ -2637,12 +2666,17 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.auth_error_paused_polling = false;
                             s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                             s.auth_watch_snapshot.clear();
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
+                            // The last reading stays on screen through a failed
+                            // request; only a widget that has never had one waits.
+                            if s.data.is_none() {
+                                s.last_poll_ok = false;
+                                s.session_text = "...".to_string();
+                                s.weekly_text = "...".to_string();
+                                s.codex_session_text = "...".to_string();
+                                s.codex_weekly_text = "...".to_string();
+                                s.antigravity_session_text = "...".to_string();
+                                s.antigravity_weekly_text = "...".to_string();
+                            }
                             s.retry_count = s.retry_count.saturating_add(1);
                             let backoff = RETRY_BASE_MS.saturating_mul(
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
@@ -3496,12 +3530,9 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
-            let successful = lock_state()
-                .as_ref()
-                .map(|s| s.last_poll_ok)
-                .unwrap_or(false);
-            if successful {
-                mark_poll();
+            match wparam.0 {
+                POLL_NO_READING => {}
+                landed => mark_poll(landed == POLL_CHANGED),
             }
             check_theme_change();
             render_layered();
@@ -3780,10 +3811,6 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
-                            s.session_text = "...".to_string();
-                            s.weekly_text = "...".to_string();
-                            s.codex_session_text = "...".to_string();
-                            s.codex_weekly_text = "...".to_string();
                             s.force_notify_auth_error = true;
                         }
                     }
