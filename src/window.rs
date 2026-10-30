@@ -19,11 +19,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::appearance::{Appearance, Mode, WIDGET_SIZE_DEFAULT};
 use crate::diagnose;
+use crate::dock;
 use crate::localization::{self, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RAM, TIMER_RESET_POLL,
-    TIMER_TOPMOST, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    self, Color, TIMER_ANIM, TIMER_COUNTDOWN, TIMER_MOTION, TIMER_POLL, TIMER_RAM,
+    TIMER_RESET_POLL, TIMER_TOPMOST, TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::readout;
@@ -90,6 +91,7 @@ struct AppState {
     tray_offset: i32,
     dragging: bool,
     floating_position: Option<(i32, i32)>,
+    dock_anchor: Option<(i32, i32)>,
     drag_start_mouse_x: i32,
     drag_start_client_x: i32,
     drag_start_offset: i32,
@@ -343,6 +345,11 @@ struct SettingsFile {
     appearance: Appearance,
     #[serde(default)]
     floating_position: Option<(i32, i32)>,
+    /// The point the floating widget docks nearest to, in screen pixels.
+    /// Absent until the widget is first dragged; an older floating_position
+    /// stands in for it until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dock_anchor: Option<(i32, i32)>,
     /// Migrate older taskbar/click-through preferences once.
     #[serde(default)]
     desktop_layout_version: u32,
@@ -389,6 +396,7 @@ impl Default for SettingsFile {
         Self {
             appearance: Appearance::default(),
             floating_position: None,
+            dock_anchor: None,
             desktop_layout_version: 1,
             tray_offset: 0,
             taskbar_index: 0,
@@ -477,6 +485,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             appearance: s.appearance.clone(),
             floating_position: s.floating_position,
+            dock_anchor: s.dock_anchor,
             desktop_layout_version: 1,
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
@@ -634,6 +643,7 @@ fn toggle_widget_visibility(hwnd: HWND) {
         } else {
             let _ = ShowWindow(hwnd, SW_HIDE);
             let _ = KillTimer(hwnd, TIMER_ANIM);
+            disarm_motion(hwnd);
         }
     }
 }
@@ -1239,29 +1249,29 @@ fn migrate_legacy_startup() {
 
 // Two ring blocks side by side: usage (5h outer, 7d inner), then the device
 // (CPU outer, RAM inner), each with its figures to the right of the rings.
-const WIDGET_HEIGHT: i32 = 62;
-const WIDGET_W: i32 = 310;
-const LEFT_DIVIDER_W: i32 = 3;
+pub(crate) const WIDGET_HEIGHT: i32 = 62;
+pub(crate) const WIDGET_W: i32 = 310;
+pub(crate) const LEFT_DIVIDER_W: i32 = 3;
 
 /// Ring blocks: where each ring sits, its diameter, and the band geometry.
-const USAGE_X: i32 = 12;
-const SYSTEM_X: i32 = 186;
-const RING_Y: i32 = 6;
-const RING_D: i32 = 50;
+pub(crate) const USAGE_X: i32 = 12;
+pub(crate) const SYSTEM_X: i32 = 186;
+pub(crate) const RING_Y: i32 = 6;
+pub(crate) const RING_D: i32 = 50;
 const RING_STROKE: i32 = 5;
 const RING_GAP: i32 = 3;
 
 /// The hairline between the usage block and the device block.
-const SPLIT_X: i32 = 178;
-const SPLIT_Y: i32 = 14;
-const SPLIT_H: i32 = 34;
+pub(crate) const SPLIT_X: i32 = 178;
+pub(crate) const SPLIT_Y: i32 = 14;
+pub(crate) const SPLIT_H: i32 = 34;
 
 /// The figure column beside each ring: label, percentage, then (usage only)
 /// the time to reset. One row per ring, outer ring first.
-const TEXT_DX: i32 = 58;
-const LABEL_W: i32 = 24;
-const FIGURE_W: i32 = 34;
-const RESET_W: i32 = 46;
+pub(crate) const TEXT_DX: i32 = 58;
+pub(crate) const LABEL_W: i32 = 24;
+pub(crate) const FIGURE_W: i32 = 34;
+pub(crate) const RESET_W: i32 = 46;
 const ROW1_Y: i32 = 15;
 const ROW2_Y: i32 = 33;
 const ROW_H: i32 = 14;
@@ -1867,6 +1877,7 @@ pub fn run() {
                 dragging: false,
                 drag_start_mouse_x: 0,
                 floating_position: settings.floating_position,
+                dock_anchor: settings.dock_anchor,
                 drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
@@ -1894,7 +1905,10 @@ pub fn run() {
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
         if !embedded {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            // No SetLayeredWindowAttributes here: the floating widget draws
+            // with per-pixel alpha through UpdateLayeredWindow, which a
+            // constant-alpha layered window would refuse.
+            init_dock(settings.dock_anchor, settings.floating_position);
             native_interop::reassert_topmost(hwnd);
 
             // Setting HWND_TOPMOST once is not enough to stay on top: it is a
@@ -2074,11 +2088,9 @@ fn render_layered() {
 
     let hwnd = hwnd_val.to_hwnd();
 
-    // For non-embedded fallback, just invalidate and let WM_PAINT handle it
+    // The floating widget docks, moves and composites itself per frame.
     if !embedded {
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
+        render_docked(hwnd);
         return;
     }
 
@@ -2208,6 +2220,673 @@ fn render_layered() {
     }
 }
 
+/// The floating widget's motion (see dock.rs), when it last stepped, and
+/// whether a finished drag still needs its resting spot saved.
+struct DockState {
+    motion: dock::Motion,
+    last_tick: f64,
+    unsaved: bool,
+}
+
+static DOCK: Mutex<Option<DockState>> = Mutex::new(None);
+
+/// Whether TIMER_MOTION is running. SetTimer on a live timer restarts its
+/// countdown, so re-arming it on every mouse move would starve it of frames.
+static MOTION_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// The motion timer's period: the shortest a window timer allows.
+const MOTION_FRAME_MS: u32 = 10;
+
+/// Corner radius of the background that shows on hover, in base pixels.
+const PANEL_RADIUS: f64 = 6.0;
+
+fn lock_dock() -> MutexGuard<'static, Option<DockState>> {
+    DOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Seconds on a monotonic clock, for the springs.
+fn clock() -> f64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
+/// Screen pixels per 96-DPI pixel on the widget's monitor.
+fn dpi_unit() -> f64 {
+    CURRENT_DPI.load(Ordering::Relaxed) as f64 / 96.0
+}
+
+/// Screen pixels per base pixel of the widget: DPI and WIDGET SIZE.
+fn widget_scale() -> f64 {
+    dpi_unit() * WIDGET_SIZE.load(Ordering::Relaxed) as f64 / 100.0
+}
+
+fn arm_motion(hwnd: HWND) {
+    if !MOTION_ARMED.swap(true, Ordering::Relaxed) {
+        unsafe {
+            SetTimer(hwnd, TIMER_MOTION, MOTION_FRAME_MS, None);
+        }
+    }
+}
+
+fn disarm_motion(hwnd: HWND) {
+    if MOTION_ARMED.swap(false, Ordering::Relaxed) {
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_MOTION);
+        }
+    }
+}
+
+/// Where a widget with no saved spot docks: the primary monitor's right
+/// edge, a third of the way down.
+fn default_dock_anchor() -> [f64; 2] {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return [0.0, 0.0];
+        }
+        let m = info.rcMonitor;
+        [
+            m.right as f64,
+            m.top as f64 + (m.bottom - m.top) as f64 / 3.0,
+        ]
+    }
+}
+
+/// Start the dock at the saved spot, or where an older floating widget sat,
+/// or the default.
+fn init_dock(saved: Option<(i32, i32)>, legacy: Option<(i32, i32)>) {
+    let anchor = saved
+        .map(|(x, y)| [x as f64, y as f64])
+        .or_else(|| {
+            legacy.map(|(x, y)| {
+                [
+                    x as f64 + total_widget_width() as f64 / 2.0,
+                    y as f64 + widget_sc(WIDGET_HEIGHT) as f64 / 2.0,
+                ]
+            })
+        })
+        .unwrap_or_else(default_dock_anchor);
+    *lock_dock() = Some(DockState {
+        motion: dock::Motion::new(anchor),
+        last_tick: clock(),
+        unsaved: false,
+    });
+}
+
+/// Send the widget back to its default spot.
+fn reset_dock(hwnd: HWND) {
+    if let Some(d) = lock_dock().as_mut() {
+        d.motion.set_anchor(default_dock_anchor());
+        d.unsaved = true;
+    }
+    arm_motion(hwnd);
+}
+
+/// The button came up or capture was lost: end the press, throwing the
+/// widget onto an edge if it was a drag.
+fn finish_press(hwnd: HWND) {
+    let pressed = match lock_dock().as_mut() {
+        Some(d) if d.motion.pressed() => {
+            if d.motion.release(clock(), dpi_unit()) {
+                d.unsaved = true;
+            }
+            true
+        }
+        // No press: a capture change from the embedded widget's own drag,
+        // which must not start the floating widget's motion timer.
+        _ => false,
+    };
+    if pressed {
+        arm_motion(hwnd);
+    }
+}
+
+fn cursor_pos() -> Option<[f64; 2]> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }
+        .ok()
+        .map(|_| [pt.x as f64, pt.y as f64])
+}
+
+/// Step the floating widget's motion and push the frame to its layered
+/// window: position, size and per-pixel alpha in one UpdateLayeredWindow.
+///
+/// The background is transparent until the cursor is over the widget, so the
+/// rings float on the desktop. Every pixel keeps at least alpha 1, which is
+/// invisible but keeps the whole widget hit-testable: a fully transparent
+/// pixel of a layered window passes the mouse through, and the hover could
+/// never start.
+fn render_docked(hwnd: HWND) {
+    let (
+        is_dark,
+        session_pct,
+        weekly_pct,
+        session_text,
+        weekly_text,
+        paces,
+        poll_interval_ms,
+        visible,
+        click_through,
+    ) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else {
+            return;
+        };
+        let (session_pace, weekly_pace) = claude_pace_markers(s.data.as_ref());
+        (
+            s.is_dark,
+            s.session_percent,
+            s.weekly_percent,
+            s.session_text.clone(),
+            s.weekly_text.clone(),
+            [session_pace, weekly_pace],
+            s.poll_interval_ms,
+            s.widget_visible,
+            s.click_through,
+        )
+    };
+    if !visible {
+        disarm_motion(hwnd);
+        return;
+    }
+
+    let monitors: Vec<dock::Rect> = native_interop::monitor_bounds()
+        .iter()
+        .map(|r| dock::Rect {
+            left: r.left as f64,
+            top: r.top as f64,
+            right: r.right as f64,
+            bottom: r.bottom as f64,
+        })
+        .collect();
+    let now = clock();
+    let over = !click_through
+        && match (cursor_pos(), native_interop::get_window_rect_safe(hwnd)) {
+            (Some([x, y]), Some(r)) => {
+                x >= r.left as f64 && x < r.right as f64 && y >= r.top as f64 && y < r.bottom as f64
+            }
+            _ => false,
+        };
+    let (frame, save) = {
+        let mut guard = lock_dock();
+        let Some(d) = guard.as_mut() else {
+            return;
+        };
+        if !d.motion.pressed() {
+            d.motion.set_hovered(over, now);
+        }
+        let dt = now - d.last_tick;
+        d.last_tick = now;
+        let Some(frame) = d
+            .motion
+            .tick(now, dt, &monitors, widget_scale(), dpi_unit())
+        else {
+            return;
+        };
+        let save = (d.unsaved && !frame.moving).then(|| {
+            d.unsaved = false;
+            d.motion.anchor()
+        });
+        (frame, save)
+    };
+    if let Some([x, y]) = save {
+        if let Some(s) = lock_state().as_mut() {
+            s.dock_anchor = Some((x.round() as i32, y.round() as i32));
+        }
+        save_state_settings();
+    }
+    if frame.moving {
+        arm_motion(hwnd);
+    } else {
+        disarm_motion(hwnd);
+    }
+
+    let live = step_anim(
+        &[session_pct, weekly_pct, 0.0, 0.0, 0.0, 0.0, 0.0],
+        &[&session_text, &weekly_text, "", "", "", "", ""],
+        last_cpu_sample(),
+        last_ram_sample(),
+        poll_interval_ms,
+    );
+
+    let width = (frame.width.ceil() as i32).max(1);
+    let height = (frame.height.ceil() as i32).max(1);
+    unsafe {
+        let screen_dc = GetDC(hwnd);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(hwnd, screen_dc);
+            return;
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+
+        compose_docked(
+            mem_dc,
+            std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize),
+            width,
+            height,
+            &frame,
+            &live,
+            is_dark,
+            [&session_text, &weekly_text],
+            paces,
+        );
+
+        let dst = POINT {
+            x: frame.left.round() as i32,
+            y: frame.top.round() as i32,
+        };
+        let size = SIZE {
+            cx: width,
+            cy: height,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let blend_fn = BLENDFUNCTION {
+            BlendOp: 0,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: 1, // AC_SRC_ALPHA
+        };
+        let _ = UpdateLayeredWindow(
+            hwnd,
+            screen_dc,
+            Some(&dst),
+            Some(&size),
+            mem_dc,
+            Some(&src),
+            COLORREF(0),
+            Some(&blend_fn),
+            ULW_ALPHA,
+        );
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(hwnd, screen_dc);
+    }
+}
+
+/// Draw one docked frame into `hdc`, whose 32-bit pixels are `pixels`, and
+/// leave them premultiplied for UpdateLayeredWindow.
+///
+/// The background, the hairlines and the figures are drawn with GDI onto an
+/// opaque background (ClearType needs one), then faded in with the hover; the
+/// rings are rasterised with their own alpha and laid over the top.
+#[allow(clippy::too_many_arguments)]
+fn compose_docked(
+    hdc: HDC,
+    pixels: &mut [u32],
+    width: i32,
+    height: i32,
+    frame: &dock::Frame,
+    live: &LiveFrame,
+    is_dark: bool,
+    texts: [&str; 2],
+    paces: [Option<f64>; 2],
+) {
+    let palette = appearance().palette(is_dark);
+    let bg = palette[0];
+    let ink = palette[1];
+    let l = &frame.layout;
+    let s = frame.scale;
+    let px = |v: f64| (v * s).round() as i32;
+    let thin = px(1.0).max(1);
+    let a = frame.hover;
+
+    let strings = localization::STRINGS;
+    let readings = ring_readings(
+        live,
+        texts,
+        paces,
+        [strings.session_window, strings.weekly_window],
+        is_dark,
+        bg,
+        anim_breath(),
+    );
+
+    unsafe {
+        fill_box(hdc, 0, 0, width, height, &bg);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+
+        if a > 0.003 {
+            // The drag handle: two hairlines along the grab edge, on the top
+            // when the widget is stacked.
+            let (div_left, div_right) = if is_dark {
+                (Color::new(80, 80, 80), Color::new(40, 40, 40))
+            } else {
+                (Color::new(160, 160, 160), Color::new(230, 230, 230))
+            };
+            let [hx, hy, hw, hh] = l.handle;
+            if frame.stacked > 0.5 {
+                fill_box(hdc, px(hx), px(hy), px(hw), px(2.0), &div_left);
+                fill_box(hdc, px(hx), px(hy + 2.0), px(hw), px(1.0), &div_right);
+            } else {
+                fill_box(hdc, px(hx), px(hy), px(2.0), px(hh), &div_left);
+                fill_box(hdc, px(hx + 2.0), px(hy), px(1.0), px(hh), &div_right);
+            }
+
+            let [sx, sy, sw, sh] = l.split;
+            fill_box(
+                hdc,
+                px(sx),
+                px(sy),
+                px(sw).max(thin),
+                px(sh).max(thin),
+                &blend(bg, ink, 0.12),
+            );
+
+            // Poll freshness: a hairline along the side facing into the
+            // screen that fills over the poll interval.
+            let face = if frame.docked {
+                frame.side
+            } else {
+                dock::Side::Bottom
+            };
+            let inset = px(6.0);
+            let track = blend(bg, ink, 0.18);
+            let lit = blend(bg, ink, 0.45);
+            match face {
+                dock::Side::Bottom | dock::Side::Top => {
+                    let y = if face == dock::Side::Bottom {
+                        0
+                    } else {
+                        height - thin
+                    };
+                    let len = width - 2 * inset;
+                    fill_box(hdc, inset, y, len, thin, &track);
+                    let filled = (len as f64 * live.poll_frac).round() as i32;
+                    fill_box(hdc, inset, y, filled, thin, &lit);
+                }
+                dock::Side::Left | dock::Side::Right => {
+                    let x = if face == dock::Side::Right {
+                        0
+                    } else {
+                        width - thin
+                    };
+                    let len = height - 2 * inset;
+                    fill_box(hdc, x, inset, thin, len, &track);
+                    let filled = (len as f64 * live.poll_frac).round() as i32;
+                    fill_box(hdc, x, inset, thin, filled, &lit);
+                }
+            }
+        }
+
+        // The figures fade in over the back half of the expansion and drift
+        // out of their ring as they appear, each block clipped to its own side
+        // of the hairline so neither runs over the other's ring mid-morph.
+        let text_a = ((frame.expanded - 0.45) / 0.55).clamp(0.0, 1.0);
+        if text_a > 0.01 {
+            let figure_font = make_font(-12, FW_SEMIBOLD);
+            let time_font = make_font(-10, FW_MEDIUM);
+            let label_font = make_font(-9, FW_SEMIBOLD);
+            let old_font = SelectObject(hdc, figure_font);
+            let label_ink = blend(bg, ink, 0.65);
+            let slide = (1.0 - text_a) * 10.0 * if frame.mirror { 1.0 } else { -1.0 };
+            let t = frame.stacked;
+            let mix = |a: f64, b: f64| a + (b - a) * t;
+            let (sx, sy) = (l.split[0], l.split[1]);
+            let clips = [
+                [0.0, 0.0, mix(sx - 3.0, l.w), mix(l.h, sy)],
+                [mix(sx + 1.0, 0.0), mix(0.0, sy + 1.0), l.w, l.h],
+            ];
+            let blocks = [
+                (l.usage_text_x, l.usage[1], &readings[0], clips[0]),
+                (l.device_text_x, l.device[1], &readings[1], clips[1]),
+            ];
+            for (text_x, ring_y, rows, clip) in blocks {
+                let saved = SaveDC(hdc);
+                let _ = IntersectClipRect(hdc, px(clip[0]), px(clip[1]), px(clip[2]), px(clip[3]));
+                let tx = px(text_x + slide);
+                for (_, row) in rows.iter() {
+                    let top = px(ring_y + (row.y - RING_Y) as f64);
+                    let bottom = top + px(ROW_H as f64);
+                    SelectObject(hdc, label_font);
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: tx,
+                            top,
+                            right: tx + px(LABEL_W as f64),
+                            bottom,
+                        },
+                        row.label,
+                        &blend(bg, label_ink, text_a),
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    let fx = tx + px(LABEL_W as f64);
+                    SelectObject(hdc, figure_font);
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: fx,
+                            top,
+                            right: fx + px(FIGURE_W as f64),
+                            bottom,
+                        },
+                        &row.figure,
+                        &blend(bg, row.figure_color, text_a),
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    if let Some((reset, color)) = row.reset {
+                        let rx = fx + px(FIGURE_W as f64);
+                        SelectObject(hdc, time_font);
+                        draw_text_in(
+                            hdc,
+                            RECT {
+                                left: rx,
+                                top,
+                                right: rx + px(RESET_W as f64),
+                                bottom,
+                            },
+                            reset,
+                            &blend(bg, color, text_a),
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                        );
+                    }
+                }
+                let _ = RestoreDC(hdc, saved);
+            }
+            SelectObject(hdc, old_font);
+            let _ = DeleteObject(figure_font);
+            let _ = DeleteObject(time_font);
+            let _ = DeleteObject(label_font);
+        }
+        let _ = GdiFlush();
+    }
+
+    // The rings, with their own alpha. Over a transparent background the
+    // tracks and pace ticks are the ink at low opacity, so they read the same
+    // over the panel and over whatever is behind the widget.
+    let mut rings = vec![Premul::default(); pixels.len()];
+    let d = px(RING_D as f64);
+    let shadow = 0.34 * (1.0 - a);
+    for (origin, block) in [(l.usage, &readings[0]), (l.device, &readings[1])] {
+        let bands = block.each_ref().map(|(band, _)| RingBand {
+            percent: band.percent,
+            fill: band.fill,
+            track: ink,
+            track_alpha: 0.16 + 0.04 * (1.0 - a),
+            tick: band
+                .tick
+                .map(|(pace, _)| (pace, pace_marker_color(is_dark))),
+            tick_alpha: 0.65,
+        });
+        let ring = ring_pixels(
+            d,
+            RING_STROKE as f64 * s,
+            RING_GAP as f64 * s,
+            [&bands[0], &bands[1]],
+            shadow,
+        );
+        let (ox, oy) = (px(origin[0]), px(origin[1]));
+        for ry in 0..d {
+            let y = oy + ry;
+            if y < 0 || y >= height {
+                continue;
+            }
+            for rx in 0..d {
+                let x = ox + rx;
+                if x < 0 || x >= width {
+                    continue;
+                }
+                let p = ring[(ry * d + rx) as usize];
+                if p.a > 0.0 {
+                    let i = (y * width + x) as usize;
+                    rings[i] = p.over(rings[i]);
+                }
+            }
+        }
+    }
+
+    // Composite: the panel, rounded and faded by the hover, under the rings.
+    let r = PANEL_RADIUS * s;
+    let (w, h) = (width as f64, height as f64);
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as usize;
+            let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+            let corner = (cx - cx.clamp(r, w - r)).hypot(cy - cy.clamp(r, h - r));
+            let pa = (a * coverage(r - corner)) as f32;
+            let rgb = pixels[i];
+            let panel = Premul {
+                r: ((rgb >> 16) & 0xFF) as f32 * pa,
+                g: ((rgb >> 8) & 0xFF) as f32 * pa,
+                b: (rgb & 0xFF) as f32 * pa,
+                a: pa,
+            };
+            let out = rings[i].over(panel);
+            let alpha = (out.a * 255.0).round().clamp(0.0, 255.0) as u32;
+            pixels[i] = if alpha == 0 {
+                0x0100_0000
+            } else {
+                let c = |v: f32| (v.round().max(0.0) as u32).min(alpha);
+                alpha << 24 | c(out.r) << 16 | c(out.g) << 8 | c(out.b)
+            };
+        }
+    }
+}
+
+/// The ring bands and their figure rows: usage (the five-hour window outside,
+/// the weekly one inside), then the device (CPU outside, RAM inside).
+fn ring_readings<'a>(
+    frame: &LiveFrame,
+    texts: [&'a str; 2],
+    paces: [Option<f64>; 2],
+    labels: [&'a str; 2],
+    is_dark: bool,
+    bg: Color,
+    breath: f64,
+) -> [[(RingBand, RingRow<'a>); 2]; 2] {
+    let appearance = appearance();
+    let palette = appearance.palette(is_dark);
+    let custom = appearance.mode == Mode::Custom;
+    let ink = palette[1];
+    let ring_track = blend(bg, ink, 0.14);
+    let lift = if is_dark {
+        Color::from_hex("#FFFFFF")
+    } else {
+        Color::from_hex("#000000")
+    };
+    // The figure, flashed toward the state's core colour for a beat after a
+    // reading lands so the change is what draws the eye, not the motion.
+    let figure_ink = |led: &Led, flash: f64| {
+        if custom {
+            ink
+        } else if is_dark {
+            blend(ink, led.core, 0.30 + 0.60 * flash)
+        } else {
+            blend(ink, led.edge, 0.45 + 0.40 * flash)
+        }
+    };
+
+    // Usage: the five-hour window on the outer ring, the weekly one inside.
+    let base = if custom {
+        let ident = palette[2];
+        Led {
+            edge: blend(ident, bg, 0.4),
+            mid: ident,
+            core: blend(ident, Color::new(255, 255, 255), 0.25),
+            glow: ident,
+        }
+    } else {
+        claude_led()
+    };
+    let usage = [
+        (0usize, labels[0], paces[0], ROW1_Y),
+        (1usize, labels[1], paces[1], ROW2_Y),
+    ];
+    let usage_bands = usage.map(|(slot, label, pace, row_y)| {
+        let pct = frame.shown[slot].clamp(0.0, 100.0);
+        let reading = readout::has_reading(texts[slot]);
+        let burn = pace.map(|p| pct - p).unwrap_or(0.0);
+        let led = state_led(pct, burn, &base);
+        let row = RingRow {
+            y: row_y,
+            label,
+            figure: readout::figure(pct, texts[slot]),
+            figure_color: figure_ink(&led, frame.flash),
+            reset: Some((
+                readout::reset_label(texts[slot]),
+                blend(ink, lift, 0.55 * frame.text_tick),
+            )),
+        };
+        let band = RingBand {
+            percent: if reading { pct } else { 0.0 },
+            fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
+            track: ring_track,
+            tick: pace
+                .filter(|_| reading)
+                .map(|p| (p, blend(pace_marker_color(is_dark), bg, 0.35))),
+            track_alpha: 1.0,
+            tick_alpha: 1.0,
+        };
+        (band, row)
+    });
+
+    // The device: CPU on the outer ring, RAM inside it.
+    let system = [("CPU", frame.cpu, ROW1_Y), ("RAM", frame.ram, ROW2_Y)];
+    let system_bands = system.map(|(label, value, row_y)| {
+        let value = value.clamp(0.0, 100.0);
+        let led = load_led(value);
+        let row = RingRow {
+            y: row_y,
+            label,
+            figure: format!("{value:.0}%"),
+            figure_color: figure_ink(&led, 0.0),
+            reset: None,
+        };
+        let band = RingBand {
+            percent: value,
+            fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
+            track: ring_track,
+            tick: None,
+            track_alpha: 1.0,
+            tick_alpha: 1.0,
+        };
+        (band, row)
+    });
+    [usage_bands, system_bands]
+}
+
 /// Paint all widget content onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
@@ -2257,7 +2936,6 @@ fn paint_content(
     let breath = anim_breath();
     let appearance = appearance();
     let palette = appearance.palette(is_dark);
-    let custom = appearance.mode == Mode::Custom;
 
     let targets = [
         session_pct,
@@ -2333,23 +3011,6 @@ fn paint_content(
 
         let ink = palette[1];
         let label_ink = blend(*bg, ink, 0.65);
-        let ring_track = blend(*bg, ink, 0.14);
-        let lift = if is_dark {
-            Color::from_hex("#FFFFFF")
-        } else {
-            Color::from_hex("#000000")
-        };
-        // The figure, flashed toward the state's core colour for a beat after a
-        // reading lands so the change is what draws the eye, not the motion.
-        let figure_ink = |led: &Led, flash: f64| {
-            if custom {
-                ink
-            } else if is_dark {
-                blend(ink, led.core, 0.30 + 0.60 * flash)
-            } else {
-                blend(ink, led.edge, 0.45 + 0.40 * flash)
-            }
-        };
         let stroke = widget_sc(RING_STROKE) as f64;
         let gap = widget_sc(RING_GAP) as f64;
         let ring_d = widget_sc(RING_D);
@@ -2359,68 +3020,15 @@ fn paint_content(
         let label_font = make_font(-9, FW_SEMIBOLD);
         let old_font = SelectObject(hdc, figure_font);
 
-        // Usage: the five-hour window on the outer ring, the weekly one inside.
-        let base = if custom {
-            let ident = palette[2];
-            Led {
-                edge: blend(ident, *bg, 0.4),
-                mid: ident,
-                core: blend(ident, Color::new(255, 255, 255), 0.25),
-                glow: ident,
-            }
-        } else {
-            claude_led()
-        };
-        let usage = [
-            (0usize, strings.session_window, session_pace, ROW1_Y),
-            (1usize, strings.weekly_window, weekly_pace, ROW2_Y),
-        ];
-        let usage_bands = usage.map(|(slot, label, pace, row_y)| {
-            let pct = frame.shown[slot].clamp(0.0, 100.0);
-            let reading = readout::has_reading(texts[slot]);
-            let burn = pace.map(|p| pct - p).unwrap_or(0.0);
-            let led = state_led(pct, burn, &base);
-            let row = RingRow {
-                y: row_y,
-                label,
-                figure: readout::figure(pct, texts[slot]),
-                figure_color: figure_ink(&led, frame.flash),
-                reset: Some((
-                    readout::reset_label(texts[slot]),
-                    blend(ink, lift, 0.55 * frame.text_tick),
-                )),
-            };
-            let band = RingBand {
-                percent: if reading { pct } else { 0.0 },
-                fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
-                track: ring_track,
-                tick: pace
-                    .filter(|_| reading)
-                    .map(|p| (p, blend(pace_marker_color(is_dark), *bg, 0.35))),
-            };
-            (band, row)
-        });
-
-        // The device: CPU on the outer ring, RAM inside it.
-        let system = [("CPU", frame.cpu, ROW1_Y), ("RAM", frame.ram, ROW2_Y)];
-        let system_bands = system.map(|(label, value, row_y)| {
-            let value = value.clamp(0.0, 100.0);
-            let led = load_led(value);
-            let row = RingRow {
-                y: row_y,
-                label,
-                figure: format!("{value:.0}%"),
-                figure_color: figure_ink(&led, 0.0),
-                reset: None,
-            };
-            let band = RingBand {
-                percent: value,
-                fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
-                track: ring_track,
-                tick: None,
-            };
-            (band, row)
-        });
+        let [usage_bands, system_bands] = ring_readings(
+            &frame,
+            [texts[0], texts[1]],
+            [session_pace, weekly_pace],
+            [strings.session_window, strings.weekly_window],
+            is_dark,
+            *bg,
+            breath,
+        );
 
         for (ring_x, bands) in [(USAGE_X, &usage_bands), (SYSTEM_X, &system_bands)] {
             let x = widget_sc(ring_x);
@@ -2839,25 +3447,11 @@ fn store_appearance(value: Appearance) {
 pub(crate) fn set_appearance(mut value: Appearance) {
     value.widget_size = value.clamped_widget_size();
     let resized = WIDGET_SIZE.swap(value.widget_size, Ordering::Relaxed) != value.widget_size;
-    if resized {
-        // Resizing keeps the widget's top-left corner where it is. A widget
-        // that was never dragged has no saved spot, and the default top-right
-        // placement is measured from the right edge, so pin where it sits now.
-        let unsaved = lock_state()
-            .as_ref()
-            .filter(|s| !s.embedded && s.floating_position.is_none())
-            .map(|s| s.hwnd.to_hwnd());
-        if let Some(rect) = unsaved.and_then(native_interop::get_window_rect_safe) {
-            if let Some(s) = lock_state().as_mut() {
-                s.floating_position.get_or_insert((rect.left, rect.top));
-            }
-        }
-    }
     store_appearance(value);
     save_state_settings();
     if resized {
-        // Clamps the kept corner into the monitor's work area and saves the
-        // result, the same path a finished drag takes.
+        // The floating widget stays docked where it is and re-lays out at the
+        // new size on the next frame.
         position_at_taskbar();
     }
     render_layered();
@@ -3221,61 +3815,10 @@ mod desktop_tests {
     }
 }
 
-/// Desktop position is independent of taskbar events and tray icon movement.
+/// The floating widget docks itself on every frame (see render_docked), so a
+/// display or layout change only needs a fresh frame.
 fn position_floating_widget() {
-    let (hwnd, saved, width) = {
-        let state = lock_state();
-        let Some(s) = state.as_ref() else {
-            return;
-        };
-        if s.dragging {
-            return;
-        }
-        (s.hwnd.to_hwnd(), s.floating_position, total_widget_width())
-    };
-    let height = widget_sc(WIDGET_HEIGHT);
-    unsafe {
-        let (x, y) = match saved {
-            Some(position) => position,
-            None => {
-                let monitor = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST);
-                let mut info = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                    return;
-                }
-                (
-                    info.rcWork.right - width - dpi_sc(16),
-                    info.rcWork.top + dpi_sc(16),
-                )
-            }
-        };
-        let works = native_interop::monitor_work_areas();
-        let position = keep_widget_on_screen(x, y, width, height, &works);
-        let changed = {
-            let mut state = lock_state();
-            let Some(s) = state.as_mut() else {
-                return;
-            };
-            let changed = s.floating_position != Some(position);
-            s.floating_position = Some(position);
-            changed
-        };
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            position.0,
-            position.1,
-            width,
-            height,
-            SWP_NOACTIVATE,
-        );
-        if changed {
-            save_state_settings();
-        }
-    }
+    render_layered();
 }
 
 /// WinEvent callback for tray icon location changes
@@ -3361,22 +3904,11 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_PAINT => {
-            // For non-embedded fallback, paint normally
-            let embedded = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.embedded).unwrap_or(false)
-            };
-            if embedded {
-                // Layered windows don't use WM_PAINT; just validate the region
-                let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
-            } else {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint(hdc, hwnd);
-                let _ = EndPaint(hwnd, &ps);
-            }
+            // Both the embedded and the floating widget draw through
+            // UpdateLayeredWindow, which does not use WM_PAINT; just validate.
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -3463,6 +3995,11 @@ unsafe extern "system" fn wnd_proc(
                     if visible {
                         render_layered();
                     }
+                }
+                TIMER_MOTION => {
+                    // Frames while the floating widget moves; render_docked
+                    // stops this timer once everything settles.
+                    render_layered();
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
@@ -3616,16 +4153,15 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONDOWN => {
             let floating = lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false);
             if floating {
-                let _ = ReleaseCapture();
-                let mut point = POINT::default();
-                let _ = GetCursorPos(&mut point);
-                let packed = ((point.y as u16 as u32) << 16) | point.x as u16 as u32;
-                let _ = SendMessageW(
-                    hwnd,
-                    WM_NCLBUTTONDOWN,
-                    WPARAM(HTCAPTION as usize),
-                    LPARAM(packed as isize),
-                );
+                // The drag is the dock's own rather than the system move loop,
+                // which could not magnet, throw or reshape the widget.
+                if let Some(cursor) = cursor_pos() {
+                    if let Some(d) = lock_dock().as_mut() {
+                        d.motion.press(cursor, clock(), widget_scale());
+                    }
+                    SetCapture(hwnd);
+                    arm_motion(hwnd);
+                }
                 return LRESULT(0);
             }
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -3648,7 +4184,16 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_MOUSEMOVE => {
             if lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false) {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
+                if let Some(cursor) = cursor_pos() {
+                    if let Some(d) = lock_dock().as_mut() {
+                        if d.motion.pressed() {
+                            d.motion.drag(cursor, clock(), dpi_unit());
+                        }
+                    }
+                }
+                // Also how a hover starts: the next frame sees the cursor.
+                arm_motion(hwnd);
+                return LRESULT(0);
             }
             let is_dragging = {
                 let state = lock_state();
@@ -3747,7 +4292,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_LBUTTONUP => {
             if lock_state().as_ref().map(|s| !s.embedded).unwrap_or(false) {
-                return DefWindowProcW(hwnd, msg, wparam, lparam);
+                finish_press(hwnd);
+                let _ = ReleaseCapture();
+                return LRESULT(0);
             }
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -3797,6 +4344,12 @@ unsafe extern "system" fn wnd_proc(
                 }
                 save_state_settings();
             }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Capture taken away mid-drag (a menu, a focus change) ends the
+            // drag where it is rather than leaving it stuck to the cursor.
+            finish_press(hwnd);
             LRESULT(0)
         }
         WM_RBUTTONUP => {
@@ -3868,9 +4421,11 @@ unsafe extern "system" fn wnd_proc(
                         if let Some(s) = state.as_mut() {
                             s.tray_offset = 0;
                             s.floating_position = None;
+                            s.dock_anchor = None;
                         }
                     }
                     save_state_settings();
+                    reset_dock(hwnd);
                     position_at_taskbar();
                 }
                 IDM_START_WITH_WINDOWS => {
@@ -4095,124 +4650,6 @@ fn show_context_menu(hwnd: HWND) {
 }
 
 /// Paint for non-embedded fallback (normal WM_PAINT path)
-fn paint(hdc: HDC, hwnd: HWND) {
-    let (
-        is_dark,
-        strings,
-        session_pct,
-        session_pace,
-        weekly_pace,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-    ) = {
-        let state = lock_state();
-        match state.as_ref() {
-            Some(s) => {
-                let (session_pace, weekly_pace) = claude_pace_markers(s.data.as_ref());
-                (
-                    s.is_dark,
-                    localization::STRINGS,
-                    s.session_percent,
-                    session_pace,
-                    weekly_pace,
-                    s.session_text.clone(),
-                    s.weekly_percent,
-                    s.weekly_text.clone(),
-                    s.codex_session_percent,
-                    s.codex_session_text.clone(),
-                    s.codex_weekly_percent,
-                    s.codex_weekly_text.clone(),
-                    s.antigravity_session_percent,
-                    s.antigravity_session_text.clone(),
-                    s.antigravity_weekly_percent,
-                    s.antigravity_weekly_text.clone(),
-                    s.show_claude_code,
-                    s.show_codex,
-                    s.show_antigravity,
-                )
-            }
-            None => return,
-        }
-    };
-
-    let accent = claude_accent_color();
-    let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
-    let track = if is_dark {
-        Color::from_hex("#444444")
-    } else {
-        Color::from_hex("#AAAAAA")
-    };
-    let palette = appearance().palette(is_dark);
-    let text_color = palette[1];
-    let bg_color = palette[0];
-
-    unsafe {
-        let mut client_rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut client_rect);
-        let width = client_rect.right - client_rect.left;
-        let height = client_rect.bottom - client_rect.top;
-
-        if width <= 0 || height <= 0 {
-            return;
-        }
-
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
-        let old_bmp = SelectObject(mem_dc, mem_bmp);
-
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            strings,
-            session_pct,
-            session_pace,
-            &session_text,
-            weekly_pct,
-            weekly_pace,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &codex_accent,
-            &antigravity_accent,
-            fable_readout(),
-        );
-
-        let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
-    }
-}
-
 /// Fill a plain rectangle. Most of the numeric layout is one- and two-pixel
 /// boxes, which do not want the rounded-rect machinery.
 fn fill_box(hdc: HDC, x: i32, y: i32, w: i32, h: i32, color: &Color) {
@@ -4282,11 +4719,16 @@ pub(crate) fn draw_text_in(
 
 /// One band of a ring gauge: how full it is, its colours, and an optional pace
 /// tick across the band at the percentage an even spend would have reached.
+/// `track_alpha` and `tick_alpha` are the opacities of the track and the tick:
+/// 1 where they are already blended onto an opaque background, less over a
+/// transparent one.
 struct RingBand {
     percent: f64,
     fill: Color,
     track: Color,
+    track_alpha: f64,
     tick: Option<(f64, Color)>,
+    tick_alpha: f64,
 }
 
 /// The figures beside a ring, one row per band: a label, the percentage, and
@@ -4304,29 +4746,57 @@ fn coverage(inside: f64) -> f64 {
     (inside + 0.5).clamp(0.0, 1.0)
 }
 
-/// Two concentric ring gauges in a `d`-pixel square at (x, y), outer band
-/// first, each filling clockwise from twelve o'clock with round caps.
+/// A premultiplied pixel: the colour channels are already scaled by `a`.
+#[derive(Clone, Copy, Default)]
+struct Premul {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
+
+impl Premul {
+    /// Paint `color` at `alpha` over this pixel.
+    fn paint(&mut self, color: Color, alpha: f64) {
+        let a = alpha.clamp(0.0, 1.0) as f32;
+        if a <= 0.0 {
+            return;
+        }
+        let k = 1.0 - a;
+        self.r = color.r as f32 * a + self.r * k;
+        self.g = color.g as f32 * a + self.g * k;
+        self.b = color.b as f32 * a + self.b * k;
+        self.a = a + self.a * k;
+    }
+
+    /// Lay this pixel over `below`.
+    fn over(self, below: Premul) -> Premul {
+        let k = 1.0 - self.a;
+        Premul {
+            r: self.r + below.r * k,
+            g: self.g + below.g * k,
+            b: self.b + below.b * k,
+            a: self.a + below.a * k,
+        }
+    }
+}
+
+/// Two concentric ring gauges in a `d`-pixel square, outer band first, each
+/// filling clockwise from twelve o'clock with round caps, as premultiplied
+/// pixels with nothing behind them. `shadow` lays a soft dark band of that
+/// opacity under each ring, which keeps them legible over a busy desktop.
 ///
 /// GDI's arcs are not anti-aliased, so the rings are rasterised here with
-/// per-pixel coverage and blitted in one go. Everything is blended onto the
-/// opaque `bg`, which is the same fake translucency `blend` documents, so the
-/// layered window's background key still sees only `bg` outside the bands.
-fn draw_rings(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    d: i32,
-    stroke: f64,
-    gap: f64,
-    bands: [&RingBand; 2],
-    bg: Color,
-) {
+/// per-pixel coverage.
+fn ring_pixels(d: i32, stroke: f64, gap: f64, bands: [&RingBand; 2], shadow: f64) -> Vec<Premul> {
+    let mut pixels = vec![Premul::default(); (d.max(0) * d.max(0)) as usize];
     if d <= 0 {
-        return;
+        return pixels;
     }
     let tau = std::f64::consts::TAU;
     let c = d as f64 / 2.0;
     let half = stroke / 2.0;
+    let shadow_half = half + stroke * 0.26;
     // Per band, outer first: its centre-line radius, how far round it fills,
     // where the fill's end cap sits, and the pace tick's direction.
     let mids = [c - half, c - half - stroke - gap];
@@ -4341,45 +4811,80 @@ fn draw_rings(
         (mid, sweep, end_cap, tick)
     });
     // Nothing is drawn inside the inner band or outside the outer one.
-    let inner_edge = geometry[1].0 - half - 2.0;
-    let mut pixels = vec![0u32; (d * d) as usize];
+    let inner_edge = geometry[1].0 - shadow_half - 2.0;
     for py in 0..d {
         for px in 0..d {
             let dx = px as f64 + 0.5 - c;
             let dy = py as f64 + 0.5 - c;
             let dist = dx.hypot(dy);
-            let mut color = bg;
-            if dist >= inner_edge && dist <= c + 1.0 {
-                // Clockwise from twelve o'clock, 0..TAU.
-                let angle = dx.atan2(-dy).rem_euclid(tau);
-                for (band, (mid, sweep, end_cap, tick)) in bands.iter().zip(geometry) {
+            if dist < inner_edge || dist > c + 2.0 {
+                continue;
+            }
+            let pixel = &mut pixels[(py * d + px) as usize];
+            if shadow > 0.0 {
+                for (mid, ..) in geometry {
                     let off = (dist - mid).abs();
-                    color = blend(color, band.track, coverage(half - off));
-                    if sweep > 0.0 {
-                        let edge = if sweep >= tau || angle <= sweep {
-                            off
-                        } else {
-                            // Round caps: the distance to the band's centre
-                            // line at either end of the arc.
-                            let start = dx.hypot(dy + mid);
-                            let end = (dx - end_cap.0).hypot(dy - end_cap.1);
-                            start.min(end)
-                        };
-                        color = blend(color, band.fill, coverage(half - edge));
-                    }
-                    if let Some((ux, uy, tick)) = tick {
-                        let along = dx * ux + dy * uy;
-                        let across = (dx * uy - dy * ux).abs();
-                        let cov = coverage(stroke * 0.14 - across)
-                            * coverage(half + 1.0 - (along - mid).abs());
-                        color = blend(color, tick, cov);
-                    }
+                    pixel.paint(Color::new(0, 0, 0), shadow * coverage(shadow_half - off));
                 }
             }
-            pixels[(py * d + px) as usize] =
-                (color.r as u32) << 16 | (color.g as u32) << 8 | color.b as u32;
+            // Clockwise from twelve o'clock, 0..TAU.
+            let angle = dx.atan2(-dy).rem_euclid(tau);
+            for (band, (mid, sweep, end_cap, tick)) in bands.iter().zip(geometry) {
+                let off = (dist - mid).abs();
+                pixel.paint(band.track, band.track_alpha * coverage(half - off));
+                if sweep > 0.0 {
+                    let edge = if sweep >= tau || angle <= sweep {
+                        off
+                    } else {
+                        // Round caps: the distance to the band's centre line
+                        // at either end of the arc.
+                        let start = dx.hypot(dy + mid);
+                        let end = (dx - end_cap.0).hypot(dy - end_cap.1);
+                        start.min(end)
+                    };
+                    pixel.paint(band.fill, coverage(half - edge));
+                }
+                if let Some((ux, uy, tick)) = tick {
+                    let along = dx * ux + dy * uy;
+                    let across = (dx * uy - dy * ux).abs();
+                    let cov = coverage(stroke * 0.14 - across)
+                        * coverage(half + 1.0 - (along - mid).abs());
+                    pixel.paint(tick, band.tick_alpha * cov);
+                }
+            }
         }
     }
+    pixels
+}
+
+/// The ring gauges drawn into `hdc` at (x, y) over the opaque `bg`, which is
+/// the same fake translucency `blend` documents.
+fn draw_rings(
+    hdc: HDC,
+    x: i32,
+    y: i32,
+    d: i32,
+    stroke: f64,
+    gap: f64,
+    bands: [&RingBand; 2],
+    bg: Color,
+) {
+    if d <= 0 {
+        return;
+    }
+    let ground = Premul {
+        r: bg.r as f32,
+        g: bg.g as f32,
+        b: bg.b as f32,
+        a: 1.0,
+    };
+    let pixels: Vec<u32> = ring_pixels(d, stroke, gap, bands, 0.0)
+        .into_iter()
+        .map(|p| {
+            let p = p.over(ground);
+            (p.r.round() as u32) << 16 | (p.g.round() as u32) << 8 | p.b.round() as u32
+        })
+        .collect();
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,

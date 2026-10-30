@@ -3,6 +3,7 @@
 mod appearance;
 mod appearance_studio;
 mod diagnose;
+mod dock;
 mod localization;
 mod models;
 mod native_interop;
