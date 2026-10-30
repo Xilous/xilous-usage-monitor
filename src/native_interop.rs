@@ -41,6 +41,10 @@ pub const TIMER_RAM: usize = 7;
 /// Fires continuously at roughly 30fps while the widget is visible, and is
 /// stopped whenever the widget is hidden so a hidden widget costs nothing.
 pub const TIMER_ANIM: usize = 8;
+/// Drives the floating widget's motion (dragging, the magnet, the springs and
+/// the hover expansion) at the timer's fastest rate. Armed only while
+/// something is moving and stopped as soon as everything settles.
+pub const TIMER_MOTION: usize = 9;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -86,33 +90,51 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
 
 /// Work areas (taskbar excluded) of every attached display, in screen coordinates.
 pub fn monitor_work_areas() -> Vec<RECT> {
+    monitor_rects_with(|info| info.rcWork)
+}
+
+/// Full bounds (taskbar included) of every attached display, in screen
+/// coordinates.
+pub fn monitor_bounds() -> Vec<RECT> {
+    monitor_rects_with(|info| info.rcMonitor)
+}
+
+fn monitor_rects_with(pick: fn(&MONITORINFO) -> RECT) -> Vec<RECT> {
+    struct Collect {
+        pick: fn(&MONITORINFO) -> RECT,
+        rects: Vec<RECT>,
+    }
+
     unsafe extern "system" fn enum_proc(
         monitor: HMONITOR,
         _hdc: HDC,
         _rect: *mut RECT,
         lparam: LPARAM,
     ) -> BOOL {
-        let areas = &mut *(lparam.0 as *mut Vec<RECT>);
+        let collect = &mut *(lparam.0 as *mut Collect);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            areas.push(info.rcWork);
+            collect.rects.push((collect.pick)(&info));
         }
         BOOL(1)
     }
 
-    let mut areas: Vec<RECT> = Vec::new();
+    let mut collect = Collect {
+        pick,
+        rects: Vec::new(),
+    };
     unsafe {
         let _ = EnumDisplayMonitors(
             HDC::default(),
             None,
             Some(enum_proc),
-            LPARAM(&mut areas as *mut _ as isize),
+            LPARAM(&mut collect as *mut _ as isize),
         );
     }
-    areas
+    collect.rects
 }
 
 /// Find a child window by class name
