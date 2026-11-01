@@ -84,6 +84,14 @@ struct AppState {
     auth_watch_mode: poller::CredentialWatchMode,
     auth_watch_snapshot: poller::CredentialWatchSnapshot,
     last_poll_ok: bool,
+    /// When a poll last brought back a Claude reading of its own, rather than
+    /// carrying the previous one through a failed request.
+    claude_fresh_at: Option<Instant>,
+    /// Fast polls fired for `reset_chased`, the latest reset time that has
+    /// passed; capped so a reset the server never moves past cannot keep the
+    /// widget polling every 5 s, while a reset that passes later gets its own.
+    reset_polls: u32,
+    reset_chased: Option<SystemTime>,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
@@ -541,13 +549,27 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
         Some(s) if s.last_poll_ok => {
             let mut icons = Vec::new();
             if s.show_claude_code {
+                // Plans without a five-hour window badge the weekly one and
+                // leave the five-hour row out of the tooltip.
+                let weekly_only = s.session_text == "n/a" && readout::has_reading(&s.weekly_text);
+                let session = if weekly_only {
+                    String::new()
+                } else {
+                    format!(
+                        "5h: {} | ",
+                        readout::tooltip_row(s.session_percent, &s.session_text)
+                    )
+                };
                 icons.push(tray_icon::TrayIconData {
                     kind: tray_icon::TrayIconKind::Claude,
-                    percent: readout::has_reading(&s.session_text).then_some(s.session_percent),
+                    percent: if weekly_only {
+                        Some(s.weekly_percent)
+                    } else {
+                        readout::has_reading(&s.session_text).then_some(s.session_percent)
+                    },
                     tooltip: format!(
-                        "{} 5h: {} | 7d: {} | Fable: {}",
+                        "{} {session}7d: {} | Fable: {}",
                         localization::STRINGS.claude_code_model,
-                        readout::tooltip_row(s.session_percent, &s.session_text),
                         readout::tooltip_row(s.weekly_percent, &s.weekly_text),
                         {
                             let (pct, reset) = fable_readout_from_state(s);
@@ -810,6 +832,37 @@ fn reset_or_dash(text: String) -> String {
     }
 }
 
+/// A Claude countdown: like `reset_or_dash`, except that a window with no
+/// usage and no reset time has simply not started, which is what an idle
+/// five-hour window reports.
+fn claude_reset_text(section: &crate::models::UsageSection, kind: poller::WindowKind) -> String {
+    let text = poller::format_reset(section, kind, localization::STRINGS);
+    if text.is_empty() && section.percentage == 0.0 {
+        "Idle".to_string()
+    } else {
+        reset_or_dash(text)
+    }
+}
+
+/// How long a Claude reading may go without a fresh poll before the widget
+/// says it is stale: three poll intervals, and never under ten minutes.
+fn stale_after(poll_interval_ms: u32) -> Duration {
+    Duration::from_millis(poll_interval_ms as u64 * 3).max(Duration::from_secs(600))
+}
+
+/// Whether the Claude reading on screen has stopped updating, because polls
+/// keep failing (or, with other providers on, keep coming back without it)
+/// and the last reading is only being carried along.
+fn claude_is_stale(s: &AppState) -> bool {
+    s.last_poll_ok
+        && s.data.as_ref().is_some_and(|d| d.claude_code.is_some())
+        && s.claude_fresh_at
+            .is_some_and(|t| t.elapsed() > stale_after(s.poll_interval_ms))
+}
+
+/// The most fast polls one passed reset time gets, at 5 s apart.
+const RESET_POLL_LIMIT: u32 = 12;
+
 fn refresh_usage_texts(state: &mut AppState) {
     if !state.last_poll_ok {
         return;
@@ -821,16 +874,8 @@ fn refresh_usage_texts(state: &mut AppState) {
     };
 
     if let Some(claude_code) = data.claude_code.as_ref() {
-        state.session_text = reset_or_dash(poller::format_reset(
-            &claude_code.session,
-            poller::WindowKind::Session,
-            strings,
-        ));
-        state.weekly_text = reset_or_dash(poller::format_reset(
-            &claude_code.weekly,
-            poller::WindowKind::Weekly,
-            strings,
-        ));
+        state.session_text = claude_reset_text(&claude_code.session, poller::WindowKind::Session);
+        state.weekly_text = claude_reset_text(&claude_code.weekly, poller::WindowKind::Weekly);
     } else if state.show_claude_code {
         state.session_text = "!".to_string();
         state.weekly_text = "!".to_string();
@@ -1505,6 +1550,53 @@ fn hot_led() -> Led {
     }
 }
 
+/// A deeper shade of `c`: darker, with the hue and saturation
+/// kept, so an inner ring reads as the same family as its outer one but
+/// clearly not the same ring.
+fn deeper(c: Color) -> Color {
+    let (r, g, b) = (c.r as f64 / 255.0, c.g as f64 / 255.0, c.b as f64 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    let (h, s) = if d < 1e-9 {
+        (0.0, 0.0)
+    } else {
+        let s = d / (1.0 - (2.0 * l - 1.0).abs());
+        let h = if max == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        (h * 60.0, s)
+    };
+    let l = (l - 0.16).max(l * 0.6);
+    let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = chroma * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = l - chroma / 2.0;
+    let to_u8 = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::new(to_u8(r), to_u8(g), to_u8(b))
+}
+
+fn deeper_led(led: &Led) -> Led {
+    Led {
+        edge: deeper(led.edge),
+        mid: deeper(led.mid),
+        core: deeper(led.core),
+        glow: deeper(led.glow),
+    }
+}
+
 fn lerp_led(a: &Led, b: &Led, t: f64) -> Led {
     Led {
         edge: blend(a.edge, b.edge, t),
@@ -1870,6 +1962,9 @@ pub fn run() {
                 auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
                 auth_watch_snapshot: Vec::new(),
                 last_poll_ok: false,
+                claude_fresh_at: None,
+                reset_polls: 0,
+                reset_chased: None,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
@@ -2053,6 +2148,7 @@ fn render_layered() {
         show_claude_code,
         show_codex,
         show_antigravity,
+        stale,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2080,6 +2176,7 @@ fn render_layered() {
                     s.show_claude_code,
                     s.show_codex,
                     s.show_antigravity,
+                    claude_is_stale(s),
                 )
             }
             None => return,
@@ -2172,6 +2269,7 @@ fn render_layered() {
             &codex_accent,
             &antigravity_accent,
             fable_readout(),
+            stale,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -2239,6 +2337,48 @@ const MOTION_FRAME_MS: u32 = 10;
 
 /// Corner radius of the background that shows on hover, in base pixels.
 const PANEL_RADIUS: f64 = 6.0;
+
+/// The disc behind each collapsed ring: its opacity, and how far it reaches
+/// past the outer band in base pixels.
+const DISC_ALPHA: f64 = 0.78;
+const DISC_MARGIN: f64 = 3.0;
+
+/// Paint a disc of `fill` at `alpha` under whatever `pixels` already holds,
+/// with a faint rim of `rim` so its edge reads over a dark wallpaper too.
+#[allow(clippy::too_many_arguments)]
+fn paint_disc(
+    pixels: &mut [Premul],
+    width: i32,
+    height: i32,
+    centre: (f64, f64),
+    radius: f64,
+    fill: Color,
+    rim: Color,
+    alpha: f64,
+) {
+    let (cx, cy) = centre;
+    let y0 = ((cy - radius - 1.0).floor() as i32).max(0);
+    let y1 = ((cy + radius + 1.0).ceil() as i32).min(height);
+    let x0 = ((cx - radius - 1.0).floor() as i32).max(0);
+    let x1 = ((cx + radius + 1.0).ceil() as i32).min(width);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dist = (x as f64 + 0.5 - cx).hypot(y as f64 + 0.5 - cy);
+            let cov = coverage(radius - dist);
+            if cov <= 0.0 {
+                continue;
+            }
+            let mut p = Premul::default();
+            p.paint(fill, alpha * cov);
+            p.paint(
+                rim,
+                alpha * 0.14 * cov * coverage(1.0 - (radius - 0.5 - dist).abs()),
+            );
+            let i = (y * width + x) as usize;
+            pixels[i] = p.over(pixels[i]);
+        }
+    }
+}
 
 fn lock_dock() -> MutexGuard<'static, Option<DockState>> {
     DOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -2371,6 +2511,7 @@ fn render_docked(hwnd: HWND) {
         poll_interval_ms,
         visible,
         click_through,
+        stale,
     ) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -2387,6 +2528,7 @@ fn render_docked(hwnd: HWND) {
             s.poll_interval_ms,
             s.widget_visible,
             s.click_through,
+            claude_is_stale(s),
         )
     };
     if !visible {
@@ -2489,6 +2631,7 @@ fn render_docked(hwnd: HWND) {
             is_dark,
             [&session_text, &weekly_text],
             paces,
+            stale,
         );
 
         let dst = POINT {
@@ -2542,6 +2685,7 @@ fn compose_docked(
     is_dark: bool,
     texts: [&str; 2],
     paces: [Option<f64>; 2],
+    stale: bool,
 ) {
     let palette = appearance().palette(is_dark);
     let bg = palette[0];
@@ -2561,6 +2705,7 @@ fn compose_docked(
         is_dark,
         bg,
         anim_breath(),
+        stale,
     );
 
     unsafe {
@@ -2639,7 +2784,6 @@ fn compose_docked(
             let time_font = make_font(-10, FW_MEDIUM);
             let label_font = make_font(-9, FW_SEMIBOLD);
             let old_font = SelectObject(hdc, figure_font);
-            let label_ink = blend(bg, ink, 0.65);
             let slide = (1.0 - text_a) * 10.0 * if frame.mirror { 1.0 } else { -1.0 };
             let t = frame.stacked;
             let mix = |a: f64, b: f64| a + (b - a) * t;
@@ -2656,7 +2800,7 @@ fn compose_docked(
                 let saved = SaveDC(hdc);
                 let _ = IntersectClipRect(hdc, px(clip[0]), px(clip[1]), px(clip[2]), px(clip[3]));
                 let tx = px(text_x + slide);
-                for (_, row) in rows.iter() {
+                for (_, row) in rows.iter().flatten() {
                     let top = px(ring_y + (row.y - RING_Y) as f64);
                     let bottom = top + px(ROW_H as f64);
                     SelectObject(hdc, label_font);
@@ -2669,7 +2813,7 @@ fn compose_docked(
                             bottom,
                         },
                         row.label,
-                        &blend(bg, label_ink, text_a),
+                        &blend(bg, row.label_color, text_a),
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
                     let fx = tx + px(LABEL_W as f64);
@@ -2716,28 +2860,47 @@ fn compose_docked(
     // The rings, with their own alpha. Over a transparent background the
     // tracks and pace ticks are the ink at low opacity, so they read the same
     // over the panel and over whatever is behind the widget.
+    //
+    // Collapsed, each ring sits on a disc of the panel colour that gives way
+    // to the panel itself as the hover fades it in. Without it the tracks were
+    // the ink at a sixth opacity, which all but vanished over a light or busy
+    // wallpaper and left a short arc floating on its own.
     let mut rings = vec![Premul::default(); pixels.len()];
     let d = px(RING_D as f64);
-    let shadow = 0.34 * (1.0 - a);
+    let disc = DISC_ALPHA * (1.0 - a);
     for (origin, block) in [(l.usage, &readings[0]), (l.device, &readings[1])] {
-        let bands = block.each_ref().map(|(band, _)| RingBand {
-            percent: band.percent,
-            fill: band.fill,
-            track: ink,
-            track_alpha: 0.16 + 0.04 * (1.0 - a),
-            tick: band
-                .tick
-                .map(|(pace, _)| (pace, pace_marker_color(is_dark))),
-            tick_alpha: 0.65,
+        let bands = block.each_ref().map(|b| {
+            b.as_ref().map(|(band, _)| RingBand {
+                percent: band.percent,
+                fill: band.fill,
+                track: ink,
+                track_alpha: 0.16 + 0.12 * (1.0 - a),
+                tick: band
+                    .tick
+                    .map(|(pace, _)| (pace, pace_marker_color(is_dark))),
+                tick_alpha: 0.65,
+            })
         });
+        let (ox, oy) = (px(origin[0]), px(origin[1]));
+        if disc > 0.003 {
+            paint_disc(
+                &mut rings,
+                width,
+                height,
+                (ox as f64 + d as f64 / 2.0, oy as f64 + d as f64 / 2.0),
+                d as f64 / 2.0 + DISC_MARGIN * s,
+                bg,
+                ink,
+                disc,
+            );
+        }
         let ring = ring_pixels(
             d,
             RING_STROKE as f64 * s,
             RING_GAP as f64 * s,
-            [&bands[0], &bands[1]],
-            shadow,
+            bands.each_ref().map(Option::as_ref),
+            0.0,
         );
-        let (ox, oy) = (px(origin[0]), px(origin[1]));
         for ry in 0..d {
             let y = oy + ry;
             if y < 0 || y >= height {
@@ -2785,8 +2948,13 @@ fn compose_docked(
     }
 }
 
-/// The ring bands and their figure rows: usage (the five-hour window outside,
-/// the weekly one inside), then the device (CPU outside, RAM inside).
+/// The ring bands and their figure rows, outer ring first: usage (the
+/// five-hour window outside, the weekly one inside), then the device (CPU
+/// outside, RAM inside). A Claude reading with no five-hour window, as on
+/// plans without that limit, leaves the weekly window alone on the outer ring
+/// with its row centred beside it. `stale` dims the usage rings and says so
+/// in place of the countdown, for a reading that has stopped updating.
+#[allow(clippy::too_many_arguments)]
 fn ring_readings<'a>(
     frame: &LiveFrame,
     texts: [&'a str; 2],
@@ -2795,7 +2963,8 @@ fn ring_readings<'a>(
     is_dark: bool,
     bg: Color,
     breath: f64,
-) -> [[(RingBand, RingRow<'a>); 2]; 2] {
+    stale: bool,
+) -> [[Option<(RingBand, RingRow<'a>)>; 2]; 2] {
     let appearance = appearance();
     let palette = appearance.palette(is_dark);
     let custom = appearance.mode == Mode::Custom;
@@ -2817,8 +2986,21 @@ fn ring_readings<'a>(
             blend(ink, led.edge, 0.45 + 0.40 * flash)
         }
     };
+    // A row's label in its ring's colour. The default light theme's ring
+    // colours are too pale for small text on its light background, so there
+    // the label leans toward the ink; a custom palette's accent is the
+    // user's own choice and is used as is.
+    let label_ink = |led: &Led| {
+        if custom || is_dark {
+            led.mid
+        } else {
+            blend(led.mid, ink, 0.45)
+        }
+    };
+    // The inner ring of each pair is a deeper shade of the outer one's
+    // colour, whatever state either is in, so the two never read as one.
+    let tone = |led: Led, inner: bool| if inner { deeper_led(&led) } else { led };
 
-    // Usage: the five-hour window on the outer ring, the weekly one inside.
     let base = if custom {
         let ident = palette[2];
         Led {
@@ -2830,28 +3012,41 @@ fn ring_readings<'a>(
     } else {
         claude_led()
     };
-    let usage = [
-        (0usize, labels[0], paces[0], ROW1_Y),
-        (1usize, labels[1], paces[1], ROW2_Y),
-    ];
-    let usage_bands = usage.map(|(slot, label, pace, row_y)| {
+    let weekly_only = texts[0] == "n/a" && readout::has_reading(texts[1]);
+    let usage = if weekly_only {
+        [Some((1usize, (ROW1_Y + ROW2_Y) / 2)), None]
+    } else {
+        [Some((0usize, ROW1_Y)), Some((1usize, ROW2_Y))]
+    };
+    let mut ring = 0;
+    let usage_bands = usage.map(|slot| {
+        let (slot, row_y) = slot?;
+        let inner = ring == 1;
+        ring += 1;
         let pct = frame.shown[slot].clamp(0.0, 100.0);
         let reading = readout::has_reading(texts[slot]);
+        let pace = paces[slot];
         let burn = pace.map(|p| pct - p).unwrap_or(0.0);
-        let led = state_led(pct, burn, &base);
+        let led = tone(state_led(pct, burn, &base), inner);
+        let mut fill = blend(led.mid, led.core, 0.10 + 0.25 * breath);
+        let mut figure_color = figure_ink(&led, frame.flash);
+        let mut reset = readout::reset_label(texts[slot]);
+        if stale && reading {
+            fill = blend(fill, ring_track, 0.55);
+            figure_color = blend(figure_color, bg, 0.4);
+            reset = "Stale";
+        }
         let row = RingRow {
             y: row_y,
-            label,
+            label: labels[slot],
+            label_color: label_ink(&led),
             figure: readout::figure(pct, texts[slot]),
-            figure_color: figure_ink(&led, frame.flash),
-            reset: Some((
-                readout::reset_label(texts[slot]),
-                blend(ink, lift, 0.55 * frame.text_tick),
-            )),
+            figure_color,
+            reset: Some((reset, blend(ink, lift, 0.55 * frame.text_tick))),
         };
         let band = RingBand {
             percent: if reading { pct } else { 0.0 },
-            fill: blend(led.mid, led.core, 0.10 + 0.25 * breath),
+            fill,
             track: ring_track,
             tick: pace
                 .filter(|_| reading)
@@ -2859,17 +3054,21 @@ fn ring_readings<'a>(
             track_alpha: 1.0,
             tick_alpha: 1.0,
         };
-        (band, row)
+        Some((band, row))
     });
 
     // The device: CPU on the outer ring, RAM inside it.
-    let system = [("CPU", frame.cpu, ROW1_Y), ("RAM", frame.ram, ROW2_Y)];
-    let system_bands = system.map(|(label, value, row_y)| {
+    let system = [
+        ("CPU", frame.cpu, ROW1_Y, false),
+        ("RAM", frame.ram, ROW2_Y, true),
+    ];
+    let system_bands = system.map(|(label, value, row_y, inner)| {
         let value = value.clamp(0.0, 100.0);
-        let led = load_led(value);
+        let led = tone(load_led(value), inner);
         let row = RingRow {
             y: row_y,
             label,
+            label_color: label_ink(&led),
             figure: format!("{value:.0}%"),
             figure_color: figure_ink(&led, 0.0),
             reset: None,
@@ -2882,7 +3081,7 @@ fn ring_readings<'a>(
             track_alpha: 1.0,
             tick_alpha: 1.0,
         };
-        (band, row)
+        Some((band, row))
     });
     [usage_bands, system_bands]
 }
@@ -2918,6 +3117,7 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
     fable: (f64, String),
+    stale: bool,
 ) {
     let poll_interval_ms = {
         let state = lock_state();
@@ -3010,7 +3210,6 @@ fn paint_content(
         let _ = SetBkMode(hdc, TRANSPARENT);
 
         let ink = palette[1];
-        let label_ink = blend(*bg, ink, 0.65);
         let stroke = widget_sc(RING_STROKE) as f64;
         let gap = widget_sc(RING_GAP) as f64;
         let ring_d = widget_sc(RING_D);
@@ -3028,6 +3227,7 @@ fn paint_content(
             is_dark,
             *bg,
             breath,
+            stale,
         );
 
         for (ring_x, bands) in [(USAGE_X, &usage_bands), (SYSTEM_X, &system_bands)] {
@@ -3039,11 +3239,11 @@ fn paint_content(
                 ring_d,
                 stroke,
                 gap,
-                [&bands[0].0, &bands[1].0],
+                bands.each_ref().map(|b| b.as_ref().map(|(band, _)| band)),
                 *bg,
             );
             let tx = x + widget_sc(TEXT_DX);
-            for (_, row) in bands.iter() {
+            for (_, row) in bands.iter().flatten() {
                 let top = widget_sc(row.y);
                 let bottom = top + widget_sc(ROW_H);
                 SelectObject(hdc, label_font);
@@ -3056,7 +3256,7 @@ fn paint_content(
                         bottom,
                     },
                     row.label,
-                    &label_ink,
+                    &row.label_color,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
                 let fx = tx + widget_sc(LABEL_W);
@@ -3138,6 +3338,9 @@ fn do_poll(send_hwnd: SendHwnd) {
             let mut state = lock_state();
             let mut landed = POLL_NO_READING;
             if let Some(s) = state.as_mut() {
+                if data.claude_code.is_some() {
+                    s.claude_fresh_at = Some(Instant::now());
+                }
                 // A provider whose request failed this round keeps its last
                 // reading rather than blanking while the others update.
                 let previous = s.data.take();
@@ -3341,11 +3544,17 @@ fn do_poll(send_hwnd: SendHwnd) {
 }
 
 fn schedule_countdown_timer() {
-    let state = lock_state();
-    let s = match state.as_ref() {
+    let mut state = lock_state();
+    let s = match state.as_mut() {
         Some(s) => s,
         None => return,
     };
+    let past = s.data.as_ref().and_then(poller::latest_past_reset);
+    if past != s.reset_chased {
+        s.reset_chased = past;
+        s.reset_polls = 0;
+    }
+    let s = &*s;
 
     let hwnd = s.hwnd.to_hwnd();
     if !s.last_poll_ok {
@@ -3361,8 +3570,9 @@ fn schedule_countdown_timer() {
         None => return,
     };
 
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
+    // If a reset time has passed, poll every 5s to pick up fresh data, for a
+    // minute at most: after that the regular poll picks it up.
+    if past.is_some() && s.reset_polls < RESET_POLL_LIMIT {
         unsafe {
             SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
         }
@@ -3432,7 +3642,20 @@ pub(crate) fn appearance() -> Appearance {
     lock_state()
         .as_ref()
         .map(|s| s.appearance.clone())
+        .or_else(|| {
+            PREVIEW_APPEARANCE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
         .unwrap_or_default()
+}
+
+/// The appearance a preview renders with, since a preview has no app state.
+static PREVIEW_APPEARANCE: Mutex<Option<Appearance>> = Mutex::new(None);
+
+pub fn set_preview_appearance(value: Appearance) {
+    *PREVIEW_APPEARANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
 }
 
 fn store_appearance(value: Appearance) {
@@ -4003,11 +4226,18 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_RESET_POLL => {
                     let should_poll = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| !s.auth_error_paused_polling)
-                            .unwrap_or(false)
+                        let mut state = lock_state();
+                        match state.as_mut() {
+                            Some(s) if s.reset_polls >= RESET_POLL_LIMIT => {
+                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                                false
+                            }
+                            Some(s) => {
+                                s.reset_polls += 1;
+                                !s.auth_error_paused_polling
+                            }
+                            None => false,
+                        }
                     };
                     if should_poll {
                         let sh = SendHwnd::from_hwnd(hwnd);
@@ -4732,10 +4962,12 @@ struct RingBand {
 }
 
 /// The figures beside a ring, one row per band: a label, the percentage, and
-/// on usage rows the time to reset.
+/// on usage rows the time to reset. The label takes its ring's colour, so the
+/// rows double as the key to which ring is which.
 struct RingRow<'a> {
     y: i32,
     label: &'a str,
+    label_color: Color,
     figure: String,
     figure_color: Color,
     reset: Option<(&'a str, Color)>,
@@ -4788,7 +5020,13 @@ impl Premul {
 ///
 /// GDI's arcs are not anti-aliased, so the rings are rasterised here with
 /// per-pixel coverage.
-fn ring_pixels(d: i32, stroke: f64, gap: f64, bands: [&RingBand; 2], shadow: f64) -> Vec<Premul> {
+fn ring_pixels(
+    d: i32,
+    stroke: f64,
+    gap: f64,
+    bands: [Option<&RingBand>; 2],
+    shadow: f64,
+) -> Vec<Premul> {
     let mut pixels = vec![Premul::default(); (d.max(0) * d.max(0)) as usize];
     if d <= 0 {
         return pixels;
@@ -4798,20 +5036,30 @@ fn ring_pixels(d: i32, stroke: f64, gap: f64, bands: [&RingBand; 2], shadow: f64
     let half = stroke / 2.0;
     let shadow_half = half + stroke * 0.26;
     // Per band, outer first: its centre-line radius, how far round it fills,
-    // where the fill's end cap sits, and the pace tick's direction.
+    // where the fill's end cap sits, and the pace tick's direction. A missing
+    // band (the usage block with only a weekly window) draws nothing at all.
     let mids = [c - half, c - half - stroke - gap];
-    let geometry = [0, 1].map(|i| {
-        let mid = mids[i];
-        let sweep = bands[i].percent.clamp(0.0, 100.0) / 100.0 * tau;
-        let end_cap = (mid * sweep.sin(), -mid * sweep.cos());
-        let tick = bands[i].tick.map(|(pace, color)| {
-            let a = pace.clamp(0.0, 100.0) / 100.0 * tau;
-            (a.sin(), -a.cos(), color)
-        });
-        (mid, sweep, end_cap, tick)
-    });
-    // Nothing is drawn inside the inner band or outside the outer one.
-    let inner_edge = geometry[1].0 - shadow_half - 2.0;
+    let geometry: Vec<_> = (0..2)
+        .filter_map(|i| {
+            let band = bands[i]?;
+            let mid = mids[i];
+            let sweep = band.percent.clamp(0.0, 100.0) / 100.0 * tau;
+            let end_cap = (mid * sweep.sin(), -mid * sweep.cos());
+            let tick = band.tick.map(|(pace, color)| {
+                let a = pace.clamp(0.0, 100.0) / 100.0 * tau;
+                (a.sin(), -a.cos(), color)
+            });
+            Some((band, (mid, sweep, end_cap, tick)))
+        })
+        .collect();
+    // Nothing is drawn inside the innermost band or outside the outer one.
+    let Some(inner_edge) = geometry
+        .iter()
+        .map(|(_, (mid, ..))| mid - shadow_half - 2.0)
+        .reduce(f64::min)
+    else {
+        return pixels;
+    };
     for py in 0..d {
         for px in 0..d {
             let dx = px as f64 + 0.5 - c;
@@ -4822,14 +5070,14 @@ fn ring_pixels(d: i32, stroke: f64, gap: f64, bands: [&RingBand; 2], shadow: f64
             }
             let pixel = &mut pixels[(py * d + px) as usize];
             if shadow > 0.0 {
-                for (mid, ..) in geometry {
+                for (_, (mid, ..)) in &geometry {
                     let off = (dist - mid).abs();
                     pixel.paint(Color::new(0, 0, 0), shadow * coverage(shadow_half - off));
                 }
             }
             // Clockwise from twelve o'clock, 0..TAU.
             let angle = dx.atan2(-dy).rem_euclid(tau);
-            for (band, (mid, sweep, end_cap, tick)) in bands.iter().zip(geometry) {
+            for &(band, (mid, sweep, end_cap, tick)) in &geometry {
                 let off = (dist - mid).abs();
                 pixel.paint(band.track, band.track_alpha * coverage(half - off));
                 if sweep > 0.0 {
@@ -4866,7 +5114,7 @@ fn draw_rings(
     d: i32,
     stroke: f64,
     gap: f64,
-    bands: [&RingBand; 2],
+    bands: [Option<&RingBand>; 2],
     bg: Color,
 ) {
     if d <= 0 {
@@ -4915,15 +5163,30 @@ fn draw_rings(
 }
 
 /// Render the real GDI widget with fixtures, without starting any live services.
-pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Result<()> {
+/// `no_session` renders a Claude reading with no five-hour window, and `stale`
+/// one that has stopped updating.
+pub fn write_preview(
+    path: &str,
+    dark: bool,
+    unavailable: bool,
+    no_session: bool,
+    stale: bool,
+) -> std::io::Result<()> {
     CURRENT_DPI.store(192, Ordering::Relaxed);
     WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
     RAM_SAMPLE.store(4200, Ordering::Relaxed);
     CPU_SAMPLE.store(1800, Ordering::Relaxed);
     let width = total_widget_width();
     let height = widget_sc(WIDGET_HEIGHT);
-    let bg = Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" });
-    let ink = Color::from_hex(if dark { "#D7DEE6" } else { "#252B32" });
+    let (bg, ink) = if appearance().mode == Mode::Custom {
+        let palette = appearance().palette(dark);
+        (palette[0], palette[1])
+    } else {
+        (
+            Color::from_hex(if dark { "#1C1C1C" } else { "#F3F3F3" }),
+            Color::from_hex(if dark { "#D7DEE6" } else { "#252B32" }),
+        )
+    };
     let track = blend(bg, ink, 0.14);
     let pixels = unsafe {
         let dc = CreateCompatibleDC(None);
@@ -4957,9 +5220,9 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
             &claude_accent_color(),
             &track,
             localization::STRINGS,
-            32.0,
-            Some(45.0),
-            "3h 12m",
+            if no_session { 0.0 } else { 32.0 },
+            (!no_session).then_some(45.0),
+            if no_session { "n/a" } else { "3h 12m" },
             58.0,
             Some(65.0),
             "4d 8h",
@@ -4977,6 +5240,7 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
             &codex_accent_color(dark),
             &antigravity_accent_color(),
             (38.0, if unavailable { "n/a" } else { "4d 8h" }.to_owned()),
+            stale,
         );
         let _ = GdiFlush();
         let pixels =
@@ -4986,6 +5250,129 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
         let _ = DeleteDC(dc);
         pixels
     };
+    write_bmp(path, width, height, &pixels)
+}
+
+/// Render the collapsed floating widget over three wallpapers (light, busy and
+/// dark, left to right), side by side or `stacked`, as a BMP.
+pub fn write_docked_preview(
+    path: &str,
+    dark: bool,
+    no_session: bool,
+    stale: bool,
+    stacked: bool,
+) -> std::io::Result<()> {
+    CURRENT_DPI.store(192, Ordering::Relaxed);
+    WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
+    let scale = 2.0;
+    let layout = dock::layout(if stacked { 1.0 } else { 0.0 }, 0.0, false);
+    let frame = dock::Frame {
+        left: 0.0,
+        top: 0.0,
+        width: layout.w * scale,
+        height: layout.h * scale,
+        scale,
+        layout,
+        stacked: if stacked { 1.0 } else { 0.0 },
+        expanded: 0.0,
+        hover: 0.0,
+        side: dock::Side::Right,
+        mirror: false,
+        docked: true,
+        moving: false,
+    };
+    let live = LiveFrame {
+        shown: [
+            if no_session { 0.0 } else { 32.0 },
+            58.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        cpu: 18.0,
+        ram: 42.0,
+        flash: 0.0,
+        text_tick: 0.0,
+        poll_frac: 0.5,
+    };
+    let (w, h) = (frame.width.ceil() as i32, frame.height.ceil() as i32);
+    let widget: Vec<u32> = unsafe {
+        let dc = CreateCompatibleDC(None);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(_) => {
+                let _ = DeleteDC(dc);
+                return Err(std::io::Error::other("DIB allocation failed"));
+            }
+        };
+        let old = SelectObject(dc, bitmap);
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+        compose_docked(
+            dc,
+            pixels,
+            w,
+            h,
+            &frame,
+            &live,
+            dark,
+            [if no_session { "n/a" } else { "3h 12m" }, "4d 8h"],
+            [(!no_session).then_some(45.0), Some(65.0)],
+            stale,
+        );
+        let out = pixels.to_vec();
+        SelectObject(dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        out
+    };
+    let pad = 24;
+    let (tile_w, tile_h) = (w + 2 * pad, h + 2 * pad);
+    let width = tile_w * 3;
+    let mut pixels = Vec::with_capacity((width * tile_h * 4) as usize);
+    for y in 0..tile_h {
+        for x in 0..width {
+            let (tile, tx) = (x / tile_w, x % tile_w);
+            let wall = match tile {
+                0 => Color::new(236, 238, 241),
+                1 if ((tx + y) / 10) % 2 == 0 => Color::new(233, 196, 120),
+                1 => Color::new(120, 160, 210),
+                _ => Color::new(16, 18, 24),
+            };
+            let (wx, wy) = (tx - pad, y - pad);
+            let (r, g, b) = if wx >= 0 && wx < w && wy >= 0 && wy < h {
+                let p = widget[(wy * w + wx) as usize];
+                let a = (p >> 24) as f64 / 255.0;
+                let ch = |shift: u32, under: u8| {
+                    (((p >> shift) & 0xFF) as f64 + under as f64 * (1.0 - a))
+                        .round()
+                        .min(255.0) as u8
+                };
+                (ch(16, wall.r), ch(8, wall.g), ch(0, wall.b))
+            } else {
+                (wall.r, wall.g, wall.b)
+            };
+            pixels.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    write_bmp(path, width, tile_h, &pixels)
+}
+
+/// A top-down 32-bit BMP of BGRA `pixels`.
+fn write_bmp(path: &str, width: i32, height: i32, pixels: &[u8]) -> std::io::Result<()> {
     // BITMAPFILEHEADER + BITMAPINFOHEADER, explicitly encoded to avoid struct padding.
     let mut bmp = Vec::with_capacity(54 + pixels.len());
     bmp.extend_from_slice(b"BM");
@@ -4998,7 +5385,7 @@ pub fn write_preview(path: &str, dark: bool, unavailable: bool) -> std::io::Resu
     bmp.extend_from_slice(&1u16.to_le_bytes());
     bmp.extend_from_slice(&32u16.to_le_bytes());
     bmp.extend_from_slice(&[0; 24]);
-    bmp.extend_from_slice(&pixels);
+    bmp.extend_from_slice(pixels);
     std::fs::write(path, bmp)
 }
 

@@ -11,9 +11,15 @@ widget itself:
 - **Usage** (left): the 5h window on the outer ring and the 7d window on the
   inner ring, each with its **percentage used** and reset countdown. A short
   tick across a ring marks where an even spend would have put you; a ring turns
-  amber, then red, when it runs high or well ahead of that pace.
+  amber, then red, when it runs high or well ahead of that pace. On a plan with
+  no 5h limit the usage response carries no 5h window, so the 7d window takes
+  the outer ring alone, and the tray badge shows the 7d figure instead. This
+  follows the response, not a setting: each account shows the windows it has.
 - **Device** (right): CPU load on the outer ring and RAM in use on the inner
   ring. Both shift from green through amber to red as headroom runs out.
+
+The inner ring of each pair is a deeper shade of the outer ring's colour, and
+each row's label is drawn in its ring's colour, so the rows double as the key.
 
 The widget shows Claude Code only. Codex and Antigravity are no longer shown or
 polled, and any provider choices saved by an older version load as Claude Code
@@ -25,10 +31,19 @@ which comes from the same usage request; no additional request is sent.
 - An em dash is unavailable data, never a fabricated 0%. `Offline` means the
   sign-in needs attention; `Waiting` means no reading has landed yet;
   `Not reported` means that quota window was absent. `Unknown` is an
-  unavailable reset time with a valid percentage.
+  unavailable reset time with a valid percentage, and `Idle` a window with no
+  usage that has not started yet.
+- Each window in the usage response is read on its own, so a window that is
+  missing or changes shape never takes the others down with it. A window with
+  no usable percentage, a negative one, or a reset far beyond its length counts
+  as absent.
 - A failed request keeps the last reading on screen while it retries; the
-  hairline along the top stays full until a new reading lands. The figures
-  flash only when a reading differs from the one shown.
+  hairline along the top stays full until a new reading lands. After three poll
+  intervals (at least ten minutes) without a fresh reading, the usage rings dim
+  and say `Stale` in place of the countdown. The figures flash only when a
+  reading differs from the one shown.
+- When a reset time passes, the widget polls every 5 seconds for at most a
+  minute to pick up the new window, then falls back to its regular interval.
 - The adapter never runs a CLI, sends a prompt, or refreshes tokens itself. It
   reads only the read-only usage endpoint. On an expired Claude sign-in, run
   `claude` and use `/login`, then **Refresh** from the tray.
@@ -58,11 +73,13 @@ gauges retain their amber/red semantic colors. Customization applies to the
 widget, not the Windows shell's notification-area icon badges.
 
 The widget is collapsed to just its rings and docked on an outer edge of your
-desktop, floating above normal application windows with a transparent
-background. On the left or right edge the usage and device rings stack; on the
-top or bottom edge they sit side by side. **Hover** it and it expands into the
-full widget, with its background, figures and reset times, growing away from
-the edge it sits on; it collapses again a moment after the cursor leaves.
+desktop, floating above normal application windows. Collapsed, each ring sits
+on a disc of the widget's background colour so it stays legible over a light
+or busy wallpaper. On the left or right edge the usage and device rings stack;
+on the top or bottom edge they sit side by side. **Hover** it and it expands
+into the full widget, with its background, figures and reset times, growing
+away from the edge it sits on; it collapses again a moment after the cursor
+leaves.
 
 At the default 100% widget size, the full widget is 310 by 62 logical pixels and
 the collapsed one 136 by 62 (62 by 136 stacked). The **Widget size** slider
@@ -104,7 +121,15 @@ they don't read credentials, poll providers, start the tray, or change settings:
 .\target\release\xilous-usage-monitor.exe --preview dark.bmp
 .\target\release\xilous-usage-monitor.exe --preview light.bmp --light
 .\target\release\xilous-usage-monitor.exe --preview unavailable.bmp --unavailable
+.\target\release\xilous-usage-monitor.exe --preview weekly-only.bmp --no-session
+.\target\release\xilous-usage-monitor.exe --preview stale.bmp --stale
+.\target\release\xilous-usage-monitor.exe --preview collapsed.bmp --docked --palette 0
 ```
+
+`--docked` renders the collapsed widget over a light, a busy and a dark
+wallpaper (add `--stacked` for the upright form), and `--palette N` renders
+with the Nth palette (0 Midnight, 1 Porcelain, 2 Evergreen, 3 Afterglow) as a
+custom theme.
 
 `--check-codex` performs one read-only Codex poll and writes a sanitized summary
 to stdout (or an error category to stderr), exiting 0 on success and 1 on failure.

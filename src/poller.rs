@@ -41,17 +41,14 @@ pub enum CredentialWatchMode {
 
 pub type CredentialWatchSnapshot = Vec<String>;
 
+/// The windows are read as loose JSON and checked one by one, so a window that
+/// changes shape (or disappears, as the five-hour window does on plans without
+/// one) cannot make the whole response unreadable and take the others with it.
 #[derive(Deserialize)]
 struct UsageResponse {
-    five_hour: Option<UsageBucket>,
-    seven_day: Option<UsageBucket>,
+    five_hour: Option<serde_json::Value>,
+    seven_day: Option<serde_json::Value>,
     limits: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct UsageBucket {
-    utilization: f64,
-    resets_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,25 +459,59 @@ fn fetch_usage(token: &str) -> Result<UsageData, PollError> {
             return Err(PollError::RequestFailed);
         }
     };
-    Ok(claude_usage_from_response(response))
+    Ok(claude_usage_from_response(response, SystemTime::now()))
 }
 
-fn claude_usage_from_response(response: UsageResponse) -> UsageData {
-    let mut data = UsageData::default();
-
-    if let Some(bucket) = &response.five_hour {
-        data.session.available = true;
-        data.session.window_minutes = Some(300);
-        data.session.percentage = bucket.utilization;
-        data.session.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+/// One Claude window from its loose JSON. Anything that is not a usable
+/// reading leaves the section unavailable rather than showing a made-up 0%:
+/// no bucket, no numeric utilization, a negative sentinel, or a reset so far
+/// off that the window cannot really be limiting anything. A reset more than
+/// a whole window in the past is a frozen timestamp, so it is dropped rather
+/// than chased.
+fn claude_window(
+    bucket: Option<&serde_json::Value>,
+    minutes: u64,
+    now: SystemTime,
+) -> UsageSection {
+    let Some(bucket) = bucket else {
+        return UsageSection::default();
+    };
+    let Some(utilization) = bucket.get("utilization").and_then(|v| v.as_f64()) else {
+        return UsageSection::default();
+    };
+    if !utilization.is_finite() || utilization < 0.0 {
+        return UsageSection::default();
     }
-
-    if let Some(bucket) = &response.seven_day {
-        data.weekly.available = true;
-        data.weekly.window_minutes = Some(10080);
-        data.weekly.percentage = bucket.utilization;
-        data.weekly.resets_at = parse_iso8601(bucket.resets_at.as_deref());
+    let window = Duration::from_secs(minutes * 60);
+    let mut resets_at = parse_iso8601(bucket.get("resets_at").and_then(|v| v.as_str()));
+    if let Some(reset) = resets_at {
+        if reset
+            .duration_since(now)
+            .is_ok_and(|ahead| ahead > window * 2)
+        {
+            return UsageSection::default();
+        }
+        if now
+            .duration_since(reset)
+            .is_ok_and(|behind| behind > window)
+        {
+            resets_at = None;
+        }
     }
+    UsageSection {
+        available: true,
+        window_minutes: Some(minutes),
+        percentage: utilization,
+        resets_at,
+    }
+}
+
+fn claude_usage_from_response(response: UsageResponse, now: SystemTime) -> UsageData {
+    let mut data = UsageData {
+        session: claude_window(response.five_hour.as_ref(), 300, now),
+        weekly: claude_window(response.seven_day.as_ref(), 10080, now),
+        ..Default::default()
+    };
 
     // Model quotas arrive in limits[], with percent already in percentage units.
     // Ignore malformed or unrelated entries without losing the overall quotas.
@@ -1359,6 +1390,19 @@ pub fn is_past_reset(data: &UsageData) -> bool {
     past(&data.session) || past(&data.weekly) || past(&data.fable)
 }
 
+/// The latest reset time, across every provider and window, that has
+/// already passed: the one a burst of fast polls is chasing.
+pub fn latest_past_reset(data: &AppUsageData) -> Option<SystemTime> {
+    let now = SystemTime::now();
+    [&data.claude_code, &data.codex, &data.antigravity]
+        .into_iter()
+        .flatten()
+        .flat_map(|usage| [&usage.session, &usage.weekly, &usage.fable])
+        .filter_map(|section| section.resets_at)
+        .filter(|&t| now.duration_since(t).is_ok())
+        .max()
+}
+
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
         || data.codex.as_ref().is_some_and(is_past_reset)
@@ -1369,9 +1413,91 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
 mod tests {
     use super::*;
 
+    /// A fixed clock a couple of days before the fixtures' reset times.
+    fn test_now() -> SystemTime {
+        parse_iso8601(Some("2026-09-20T12:00:00Z")).unwrap()
+    }
+
+    fn claude(json: &str) -> UsageData {
+        claude_usage_from_response(serde_json::from_str(json).unwrap(), test_now())
+    }
+
+    const WEEKLY: &str = r#""seven_day":{"utilization":40,"resets_at":"2026-09-22T12:00:00Z"}"#;
+
+    #[test]
+    fn claude_without_a_five_hour_window_keeps_the_weekly_one() {
+        for five_hour in [
+            "",
+            r#""five_hour":null,"#,
+            r#""five_hour":{"utilization":null,"resets_at":null},"#,
+            r#""five_hour":{"resets_at":"2026-09-20T14:00:00Z"},"#,
+            r#""five_hour":{"utilization":"12","resets_at":null},"#,
+            r#""five_hour":{"utilization":-1,"resets_at":null},"#,
+            r#""five_hour":{"utilization":0,"resets_at":"9999-12-31T00:00:00Z"},"#,
+            r#""five_hour":"unlimited","#,
+        ] {
+            let usage = claude(&format!("{{{five_hour}{WEEKLY}}}"));
+            assert!(!usage.session.available, "{five_hour}");
+            assert!(usage.weekly.available, "{five_hour}");
+            assert_eq!(usage.weekly.percentage, 40.0);
+            assert_eq!(
+                usage.weekly.resets_at,
+                parse_iso8601(Some("2026-09-22T12:00:00Z"))
+            );
+        }
+    }
+
+    #[test]
+    fn claude_five_hour_window_still_reads_for_plans_that_have_it() {
+        let usage = claude(&format!(
+            r#"{{"five_hour":{{"utilization":32,"resets_at":"2026-09-20T15:00:00Z"}},{WEEKLY}}}"#
+        ));
+        assert!(usage.session.available);
+        assert_eq!(usage.session.percentage, 32.0);
+        assert_eq!(usage.session.window_minutes, Some(300));
+        assert_eq!(
+            usage.session.resets_at,
+            parse_iso8601(Some("2026-09-20T15:00:00Z"))
+        );
+        // An idle window: no usage yet, so no reset time either.
+        let idle = claude(&format!(
+            r#"{{"five_hour":{{"utilization":0,"resets_at":null}},{WEEKLY}}}"#
+        ));
+        assert!(idle.session.available);
+        assert_eq!(idle.session.resets_at, None);
+    }
+
+    #[test]
+    fn claude_frozen_reset_times_are_dropped_not_chased() {
+        // Six hours stale for a five-hour window: no longer a real reset time.
+        let usage = claude(&format!(
+            r#"{{"five_hour":{{"utilization":5,"resets_at":"2026-09-20T06:00:00Z"}},{WEEKLY}}}"#
+        ));
+        assert!(usage.session.available);
+        assert_eq!(usage.session.resets_at, None);
+        // A reset that has only just passed is still chased.
+        let usage = claude(&format!(
+            r#"{{"five_hour":{{"utilization":5,"resets_at":"2026-09-20T11:59:00Z"}},{WEEKLY}}}"#
+        ));
+        assert_eq!(
+            usage.session.resets_at,
+            parse_iso8601(Some("2026-09-20T11:59:00Z"))
+        );
+    }
+
+    #[test]
+    fn claude_malformed_weekly_does_not_sink_the_rest() {
+        let usage = claude(
+            r#"{"five_hour":{"utilization":20,"resets_at":null},"seven_day":{"utilization":null}}"#,
+        );
+        assert!(usage.session.available);
+        assert!(!usage.weekly.available);
+    }
+
     #[test]
     fn claude_fable_uses_scoped_percent_and_its_own_reset() {
-        let response = serde_json::from_str(r#"{
+        let response = serde_json::from_str(
+            r#"{
             "five_hour":{"utilization":12,"resets_at":null},
             "seven_day":{"utilization":25,"resets_at":"2026-09-22T12:00:00Z"},
             "limits":[
@@ -1379,20 +1505,33 @@ mod tests {
                 {"percent":38,"resets_at":"2026-09-23T12:00:00Z",
                  "scope":{"model":{"display_name":"Fable"}}}
             ]
-        }"#).unwrap();
-        let usage = claude_usage_from_response(response);
+        }"#,
+        )
+        .unwrap();
+        let usage = claude_usage_from_response(response, test_now());
         assert_eq!(usage.session.percentage, 12.0);
         assert_eq!(usage.weekly.percentage, 25.0);
         assert!(usage.fable.available);
         assert_eq!(usage.fable.percentage, 38.0);
-        assert_eq!(usage.fable.resets_at, parse_iso8601(Some("2026-09-23T12:00:00Z")));
+        assert_eq!(
+            usage.fable.resets_at,
+            parse_iso8601(Some("2026-09-23T12:00:00Z"))
+        );
     }
 
     #[test]
     fn claude_fable_missing_or_malformed_is_unavailable() {
-        for limits in ["null", "{}", "[]", r#"[null,{"scope":{"model":{"display_name":"Fable"}},"percent":"38"}]"#] {
-            let response = serde_json::from_str(&format!(r#"{{"seven_day":{{"utilization":25,"resets_at":null}},"limits":{limits}}}"#)).unwrap();
-            let usage = claude_usage_from_response(response);
+        for limits in [
+            "null",
+            "{}",
+            "[]",
+            r#"[null,{"scope":{"model":{"display_name":"Fable"}},"percent":"38"}]"#,
+        ] {
+            let response = serde_json::from_str(&format!(
+                r#"{{"seven_day":{{"utilization":25,"resets_at":null}},"limits":{limits}}}"#
+            ))
+            .unwrap();
+            let usage = claude_usage_from_response(response, test_now());
             assert!(usage.weekly.available);
             assert!(!usage.fable.available);
         }
@@ -1400,8 +1539,11 @@ mod tests {
 
     #[test]
     fn claude_fable_zero_is_available_without_inventing_a_reset() {
-        let response = serde_json::from_str(r#"{"limits":[{"percent":0,"scope":{"model":{"display_name":"Fable 5.1"}}}]}"#).unwrap();
-        let usage = claude_usage_from_response(response);
+        let response = serde_json::from_str(
+            r#"{"limits":[{"percent":0,"scope":{"model":{"display_name":"Fable 5.1"}}}]}"#,
+        )
+        .unwrap();
+        let usage = claude_usage_from_response(response, test_now());
         assert!(usage.fable.available);
         assert_eq!(usage.fable.percentage, 0.0);
         assert_eq!(usage.fable.resets_at, None);
@@ -1409,9 +1551,14 @@ mod tests {
 
     #[test]
     fn fable_reset_triggers_refresh() {
-        let usage = UsageData { fable: UsageSection {
-            available: true, resets_at: Some(SystemTime::UNIX_EPOCH), ..Default::default()
-        }, ..Default::default() };
+        let usage = UsageData {
+            fable: UsageSection {
+                available: true,
+                resets_at: Some(SystemTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         assert!(is_past_reset(&usage));
     }
 
@@ -1435,11 +1582,7 @@ mod tests {
         assert!(usage.session.available);
         assert!(!usage.weekly.available);
         assert_eq!(
-            format_reset(
-                &usage.weekly,
-                WindowKind::Weekly,
-                STRINGS
-            ),
+            format_reset(&usage.weekly, WindowKind::Weekly, STRINGS),
             "n/a"
         );
     }
