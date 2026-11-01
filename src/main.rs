@@ -44,16 +44,44 @@ fn main() {
         }
     }
     // Offline UI harness: no credentials, network calls, tray icon or settings writes.
+    // --palette N renders with the Nth appearance preset as a custom theme;
+    // --docked renders the collapsed floating widget over sample wallpapers.
     if let Some(index) = args.iter().position(|arg| arg == "--preview") {
+        let flag = |name: &str| args.iter().any(|a| a == name);
+        if let Some(preset) = args
+            .iter()
+            .position(|a| a == "--palette")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| appearance::PRESETS.get(n))
+        {
+            window::set_preview_appearance(appearance::Appearance {
+                mode: appearance::Mode::Custom,
+                colors: preset.1,
+                ..Default::default()
+            });
+        }
         let result = args
             .get(index + 1)
             .ok_or_else(|| std::io::Error::other("expected BMP path"))
             .and_then(|path| {
-                window::write_preview(
-                    path,
-                    !args.iter().any(|a| a == "--light"),
-                    args.iter().any(|a| a == "--unavailable"),
-                )
+                if flag("--docked") {
+                    window::write_docked_preview(
+                        path,
+                        !flag("--light"),
+                        flag("--no-session"),
+                        flag("--stale"),
+                        flag("--stacked"),
+                    )
+                } else {
+                    window::write_preview(
+                        path,
+                        !flag("--light"),
+                        flag("--unavailable"),
+                        flag("--no-session"),
+                        flag("--stale"),
+                    )
+                }
             });
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
