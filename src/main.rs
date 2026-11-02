@@ -45,7 +45,8 @@ fn main() {
     }
     // Offline UI harness: no credentials, network calls, tray icon or settings writes.
     // --palette N renders with the Nth appearance preset as a custom theme;
-    // --docked renders the collapsed floating widget over sample wallpapers.
+    // --docked renders the collapsed floating widget over sample wallpapers,
+    // or the hovered one with --expanded.
     if let Some(index) = args.iter().position(|arg| arg == "--preview") {
         let flag = |name: &str| args.iter().any(|a| a == name);
         if let Some(preset) = args
@@ -72,6 +73,7 @@ fn main() {
                         flag("--no-session"),
                         flag("--stale"),
                         flag("--stacked"),
+                        flag("--expanded"),
                     )
                 } else {
                     window::write_preview(

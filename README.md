@@ -11,7 +11,9 @@ widget itself:
 - **Usage** (left): the 5h window on the outer ring and the 7d window on the
   inner ring, each with its **percentage used** and reset countdown. A short
   tick across a ring marks where an even spend would have put you; a ring turns
-  amber, then red, when it runs high or well ahead of that pace. On a plan with
+  amber, then red, when it runs high or well ahead of that pace. The 7d row
+  also gives that pace as a figure, `pace 65%`, so how far ahead of or behind
+  it the week is reads exactly against the percentage used. On a plan with
   no 5h limit the usage response carries no 5h window, so the 7d window takes
   the outer ring alone, and the tray badge shows the 7d figure instead. This
   follows the response, not a setting: each account shows the windows it has.
@@ -81,7 +83,7 @@ into the full widget, with its background, figures and reset times, growing
 away from the edge it sits on; it collapses again a moment after the cursor
 leaves.
 
-At the default 100% widget size, the full widget is 310 by 62 logical pixels and
+At the default 100% widget size, the full widget is 360 by 62 logical pixels and
 the collapsed one 136 by 62 (62 by 136 stacked). The **Widget size** slider
 scales those from 75% to 200%, on top of monitor DPI scaling. Dark and light
 system themes are supported. Ambient animation runs at 10 Hz and motion at the
@@ -124,10 +126,12 @@ they don't read credentials, poll providers, start the tray, or change settings:
 .\target\release\xilous-usage-monitor.exe --preview weekly-only.bmp --no-session
 .\target\release\xilous-usage-monitor.exe --preview stale.bmp --stale
 .\target\release\xilous-usage-monitor.exe --preview collapsed.bmp --docked --palette 0
+.\target\release\xilous-usage-monitor.exe --preview hovered.bmp --docked --expanded
 ```
 
 `--docked` renders the collapsed widget over a light, a busy and a dark
-wallpaper (add `--stacked` for the upright form), and `--palette N` renders
+wallpaper (add `--stacked` for the upright form and `--expanded` for the
+hovered, fully expanded widget), and `--palette N` renders
 with the Nth palette (0 Midnight, 1 Porcelain, 2 Evergreen, 3 Afterglow) as a
 custom theme.
 
