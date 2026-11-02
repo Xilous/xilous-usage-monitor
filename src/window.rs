@@ -1295,28 +1295,31 @@ fn migrate_legacy_startup() {
 // Two ring blocks side by side: usage (5h outer, 7d inner), then the device
 // (CPU outer, RAM inner), each with its figures to the right of the rings.
 pub(crate) const WIDGET_HEIGHT: i32 = 62;
-pub(crate) const WIDGET_W: i32 = 310;
+pub(crate) const WIDGET_W: i32 = 360;
 pub(crate) const LEFT_DIVIDER_W: i32 = 3;
 
 /// Ring blocks: where each ring sits, its diameter, and the band geometry.
 pub(crate) const USAGE_X: i32 = 12;
-pub(crate) const SYSTEM_X: i32 = 186;
+pub(crate) const SYSTEM_X: i32 = 236;
 pub(crate) const RING_Y: i32 = 6;
 pub(crate) const RING_D: i32 = 50;
 const RING_STROKE: i32 = 5;
 const RING_GAP: i32 = 3;
 
 /// The hairline between the usage block and the device block.
-pub(crate) const SPLIT_X: i32 = 178;
+pub(crate) const SPLIT_X: i32 = 228;
 pub(crate) const SPLIT_Y: i32 = 14;
 pub(crate) const SPLIT_H: i32 = 34;
 
 /// The figure column beside each ring: label, percentage, then (usage only)
-/// the time to reset. One row per ring, outer ring first.
+/// the time to reset and, on the weekly row, the pace: a label and the
+/// percentage its ring's tick marks. One row per ring, outer ring first.
 pub(crate) const TEXT_DX: i32 = 58;
 pub(crate) const LABEL_W: i32 = 24;
 pub(crate) const FIGURE_W: i32 = 34;
 pub(crate) const RESET_W: i32 = 46;
+const PACE_LABEL_W: i32 = 24;
+pub(crate) const PACE_W: i32 = PACE_LABEL_W + 26;
 const ROW1_Y: i32 = 15;
 const ROW2_Y: i32 = 33;
 const ROW_H: i32 = 14;
@@ -2702,6 +2705,7 @@ fn compose_docked(
         texts,
         paces,
         [strings.session_window, strings.weekly_window],
+        strings.pace,
         is_dark,
         bg,
         anim_breath(),
@@ -2846,6 +2850,36 @@ fn compose_docked(
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                         );
                     }
+                    if let Some(pace) = &row.pace {
+                        let lx = fx + px(FIGURE_W as f64) + px(RESET_W as f64);
+                        let vx = lx + px(PACE_LABEL_W as f64);
+                        SelectObject(hdc, label_font);
+                        draw_text_in(
+                            hdc,
+                            RECT {
+                                left: lx,
+                                top,
+                                right: vx,
+                                bottom,
+                            },
+                            pace.label,
+                            &blend(bg, pace.label_color, text_a),
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
+                        SelectObject(hdc, time_font);
+                        draw_text_in(
+                            hdc,
+                            RECT {
+                                left: vx,
+                                top,
+                                right: lx + px(PACE_W as f64),
+                                bottom,
+                            },
+                            &pace.figure,
+                            &blend(bg, pace.figure_color, text_a),
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
                 }
                 let _ = RestoreDC(hdc, saved);
             }
@@ -2953,13 +2987,15 @@ fn compose_docked(
 /// outside, RAM inside). A Claude reading with no five-hour window, as on
 /// plans without that limit, leaves the weekly window alone on the outer ring
 /// with its row centred beside it. `stale` dims the usage rings and says so
-/// in place of the countdown, for a reading that has stopped updating.
+/// in place of the countdown, for a reading that has stopped updating. The
+/// weekly row ends with its pace, labelled `pace_label`.
 #[allow(clippy::too_many_arguments)]
 fn ring_readings<'a>(
     frame: &LiveFrame,
     texts: [&'a str; 2],
     paces: [Option<f64>; 2],
     labels: [&'a str; 2],
+    pace_label: &'a str,
     is_dark: bool,
     bg: Color,
     breath: f64,
@@ -3026,6 +3062,8 @@ fn ring_readings<'a>(
         let pct = frame.shown[slot].clamp(0.0, 100.0);
         let reading = readout::has_reading(texts[slot]);
         let pace = paces[slot];
+        let tick = pace.filter(|_| reading);
+        let tick_color = blend(pace_marker_color(is_dark), bg, 0.35);
         let burn = pace.map(|p| pct - p).unwrap_or(0.0);
         let led = tone(state_led(pct, burn, &base), inner);
         let mut fill = blend(led.mid, led.core, 0.10 + 0.25 * breath);
@@ -3043,14 +3081,18 @@ fn ring_readings<'a>(
             figure: readout::figure(pct, texts[slot]),
             figure_color,
             reset: Some((reset, blend(ink, lift, 0.55 * frame.text_tick))),
+            pace: tick.filter(|_| slot == 1).map(|p| RowPace {
+                label: pace_label,
+                label_color: tick_color,
+                figure: format!("{:.0}%", p.clamp(0.0, 100.0)),
+                figure_color: ink,
+            }),
         };
         let band = RingBand {
             percent: if reading { pct } else { 0.0 },
             fill,
             track: ring_track,
-            tick: pace
-                .filter(|_| reading)
-                .map(|p| (p, blend(pace_marker_color(is_dark), bg, 0.35))),
+            tick: tick.map(|p| (p, tick_color)),
             track_alpha: 1.0,
             tick_alpha: 1.0,
         };
@@ -3072,6 +3114,7 @@ fn ring_readings<'a>(
             figure: format!("{value:.0}%"),
             figure_color: figure_ink(&led, 0.0),
             reset: None,
+            pace: None,
         };
         let band = RingBand {
             percent: value,
@@ -3224,6 +3267,7 @@ fn paint_content(
             [texts[0], texts[1]],
             [session_pace, weekly_pace],
             [strings.session_window, strings.weekly_window],
+            strings.pace,
             is_dark,
             *bg,
             breath,
@@ -3287,6 +3331,36 @@ fn paint_content(
                         reset,
                         &color,
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                    );
+                }
+                if let Some(pace) = &row.pace {
+                    let lx = fx + widget_sc(FIGURE_W) + widget_sc(RESET_W);
+                    let vx = lx + widget_sc(PACE_LABEL_W);
+                    SelectObject(hdc, label_font);
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: lx,
+                            top,
+                            right: vx,
+                            bottom,
+                        },
+                        pace.label,
+                        &pace.label_color,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
+                    SelectObject(hdc, time_font);
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: vx,
+                            top,
+                            right: lx + widget_sc(PACE_W),
+                            bottom,
+                        },
+                        &pace.figure,
+                        &pace.figure_color,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
                 }
             }
@@ -3996,8 +4070,8 @@ mod desktop_tests {
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 100), 62);
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 200), 124);
         assert_eq!(scale_px(WIDGET_HEIGHT, 144, 200), 186);
-        assert_eq!(widget_width_at(96, 100), 310);
-        assert_eq!(widget_width_at(96, 200), 620);
+        assert_eq!(widget_width_at(96, 100), 360);
+        assert_eq!(widget_width_at(96, 200), 720);
         assert_eq!(widget_width_at(192, 100), widget_width_at(96, 200));
     }
 
@@ -4971,6 +5045,18 @@ struct RingRow<'a> {
     figure: String,
     figure_color: Color,
     reset: Option<(&'a str, Color)>,
+    pace: Option<RowPace<'a>>,
+}
+
+/// The weekly row's pace: where an even spend across the window would have
+/// put it by now, which is the percentage its ring's tick marks, so how far
+/// ahead of or behind that the week is reads exactly. Present only while the
+/// tick is drawn. The label takes the tick's colour.
+struct RowPace<'a> {
+    label: &'a str,
+    label_color: Color,
+    figure: String,
+    figure_color: Color,
 }
 
 /// Pixel coverage for a distance inside an edge, ramped over one pixel.
@@ -5253,19 +5339,22 @@ pub fn write_preview(
     write_bmp(path, width, height, &pixels)
 }
 
-/// Render the collapsed floating widget over three wallpapers (light, busy and
-/// dark, left to right), side by side or `stacked`, as a BMP.
+/// Render the floating widget over three wallpapers (light, busy and dark,
+/// left to right), side by side or `stacked`, collapsed or hovered and fully
+/// `expanded`, as a BMP.
 pub fn write_docked_preview(
     path: &str,
     dark: bool,
     no_session: bool,
     stale: bool,
     stacked: bool,
+    expanded: bool,
 ) -> std::io::Result<()> {
     CURRENT_DPI.store(192, Ordering::Relaxed);
     WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
     let scale = 2.0;
-    let layout = dock::layout(if stacked { 1.0 } else { 0.0 }, 0.0, false);
+    let open = if expanded { 1.0 } else { 0.0 };
+    let layout = dock::layout(if stacked { 1.0 } else { 0.0 }, open, false);
     let frame = dock::Frame {
         left: 0.0,
         top: 0.0,
@@ -5274,9 +5363,14 @@ pub fn write_docked_preview(
         scale,
         layout,
         stacked: if stacked { 1.0 } else { 0.0 },
-        expanded: 0.0,
-        hover: 0.0,
-        side: dock::Side::Right,
+        expanded: open,
+        hover: open,
+        // An edge whose expanded form has its figures right of the rings.
+        side: if stacked {
+            dock::Side::Left
+        } else {
+            dock::Side::Bottom
+        },
         mirror: false,
         docked: true,
         moving: false,
