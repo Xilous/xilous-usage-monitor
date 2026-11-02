@@ -31,7 +31,6 @@ pub const STRINGS: Strings = Strings {
     show_widget: "Show Widget",
     session_window: "5h",
     weekly_window: "7d",
-    pace: "pace",
     now: "now",
     day_suffix: "d",
     hour_suffix: "h",

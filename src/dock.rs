@@ -12,8 +12,8 @@
 //! monitors, the cursor and the clock, and draws whatever frame it returns.
 
 use crate::window::{
-    FIGURE_W, LABEL_W, LEFT_DIVIDER_W, PACE_W, RESET_W, RING_D, RING_Y, SPLIT_H, SPLIT_X, SPLIT_Y,
-    SYSTEM_X, TEXT_DX, USAGE_X, WIDGET_HEIGHT, WIDGET_W,
+    FIGURE_W, LABEL_W, LEFT_DIVIDER_W, RESET_W, RING_D, RING_Y, SPLIT_H, SPLIT_X, SPLIT_Y,
+    SYSTEM_X, TEXT_DX, USAGE_FIGURE_W, USAGE_X, WIDGET_HEIGHT, WIDGET_W,
 };
 
 /// Magnet and throw tuning, in base pixels (96 DPI) and seconds.
@@ -374,7 +374,7 @@ fn pad() -> f64 {
 }
 
 fn usage_text_w() -> f64 {
-    (LABEL_W + FIGURE_W + RESET_W + PACE_W) as f64
+    (LABEL_W + USAGE_FIGURE_W + RESET_W) as f64
 }
 
 fn device_text_w() -> f64 {
@@ -849,8 +849,8 @@ mod tests {
     #[test]
     fn layouts_match_the_shipped_widget_and_its_collapsed_forms() {
         let full = layout(0.0, 1.0, false);
-        assert_eq!((full.w, full.h), (360.0, 62.0));
-        assert_eq!(full.device, [236.0, 6.0]);
+        assert_eq!((full.w, full.h), (350.0, 62.0));
+        assert_eq!(full.device, [226.0, 6.0]);
         assert!(full.usage_text_x + usage_text_w() < full.split[0]);
         let flat = layout(0.0, 0.0, false);
         assert_eq!((flat.w, flat.h), (136.0, 62.0));
@@ -860,7 +860,7 @@ mod tests {
         assert_eq!(upright.usage, [6.0, 12.0]);
         assert_eq!(upright.device, [6.0, 78.0]);
         let tall = layout(1.0, 1.0, true);
-        assert_eq!((tall.w, tall.h), (226.0, 136.0));
+        assert_eq!((tall.w, tall.h), (216.0, 136.0));
         // On the right edge the rings keep their distance from the edge.
         assert_eq!(tall.w - tall.usage[0], upright.w - upright.usage[0]);
         assert!(tall.usage_text_x + usage_text_w() <= tall.usage[0]);
@@ -1005,7 +1005,7 @@ mod tests {
         }
         let f = f.unwrap();
         assert!(f.mirror && f.expanded > 0.99);
-        assert!((f.width - 226.0).abs() < 0.5);
+        assert!((f.width - 216.0).abs() < 0.5);
         assert!((f.left + f.width - 1920.0).abs() < 0.5);
     }
 }

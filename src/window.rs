@@ -1295,31 +1295,31 @@ fn migrate_legacy_startup() {
 // Two ring blocks side by side: usage (5h outer, 7d inner), then the device
 // (CPU outer, RAM inner), each with its figures to the right of the rings.
 pub(crate) const WIDGET_HEIGHT: i32 = 62;
-pub(crate) const WIDGET_W: i32 = 360;
+pub(crate) const WIDGET_W: i32 = 350;
 pub(crate) const LEFT_DIVIDER_W: i32 = 3;
 
 /// Ring blocks: where each ring sits, its diameter, and the band geometry.
 pub(crate) const USAGE_X: i32 = 12;
-pub(crate) const SYSTEM_X: i32 = 236;
+pub(crate) const SYSTEM_X: i32 = 226;
 pub(crate) const RING_Y: i32 = 6;
 pub(crate) const RING_D: i32 = 50;
 const RING_STROKE: i32 = 5;
 const RING_GAP: i32 = 3;
 
 /// The hairline between the usage block and the device block.
-pub(crate) const SPLIT_X: i32 = 228;
+pub(crate) const SPLIT_X: i32 = 218;
 pub(crate) const SPLIT_Y: i32 = 14;
 pub(crate) const SPLIT_H: i32 = 34;
 
 /// The figure column beside each ring: label, percentage, then (usage only)
-/// the time to reset and, on the weekly row, the pace: a label and the
-/// percentage its ring's tick marks. One row per ring, outer ring first.
+/// the time to reset. One row per ring, outer ring first. The usage rows'
+/// percentage column is wider, for the weekly row's usage over its pace, the
+/// percentage its ring's tick marks: `100% / 100%` at the widest.
 pub(crate) const TEXT_DX: i32 = 58;
 pub(crate) const LABEL_W: i32 = 24;
 pub(crate) const FIGURE_W: i32 = 34;
+pub(crate) const USAGE_FIGURE_W: i32 = 74;
 pub(crate) const RESET_W: i32 = 46;
-const PACE_LABEL_W: i32 = 24;
-pub(crate) const PACE_W: i32 = PACE_LABEL_W + 26;
 const ROW1_Y: i32 = 15;
 const ROW2_Y: i32 = 33;
 const ROW_H: i32 = 14;
@@ -2705,7 +2705,6 @@ fn compose_docked(
         texts,
         paces,
         [strings.session_window, strings.weekly_window],
-        strings.pace,
         is_dark,
         bg,
         anim_breath(),
@@ -2797,10 +2796,22 @@ fn compose_docked(
                 [mix(sx + 1.0, 0.0), mix(0.0, sy + 1.0), l.w, l.h],
             ];
             let blocks = [
-                (l.usage_text_x, l.usage[1], &readings[0], clips[0]),
-                (l.device_text_x, l.device[1], &readings[1], clips[1]),
+                (
+                    l.usage_text_x,
+                    l.usage[1],
+                    &readings[0],
+                    clips[0],
+                    USAGE_FIGURE_W,
+                ),
+                (
+                    l.device_text_x,
+                    l.device[1],
+                    &readings[1],
+                    clips[1],
+                    FIGURE_W,
+                ),
             ];
-            for (text_x, ring_y, rows, clip) in blocks {
+            for (text_x, ring_y, rows, clip, figure_w) in blocks {
                 let saved = SaveDC(hdc);
                 let _ = IntersectClipRect(hdc, px(clip[0]), px(clip[1]), px(clip[2]), px(clip[3]));
                 let tx = px(text_x + slide);
@@ -2821,21 +2832,34 @@ fn compose_docked(
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
                     let fx = tx + px(LABEL_W as f64);
+                    let figure_rect = RECT {
+                        left: fx,
+                        top,
+                        right: fx + px(figure_w as f64),
+                        bottom,
+                    };
                     SelectObject(hdc, figure_font);
                     draw_text_in(
                         hdc,
-                        RECT {
-                            left: fx,
-                            top,
-                            right: fx + px(FIGURE_W as f64),
-                            bottom,
-                        },
+                        figure_rect,
                         &row.figure,
                         &blend(bg, row.figure_color, text_a),
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
+                    if let Some((pace, color)) = &row.pace {
+                        draw_text_in(
+                            hdc,
+                            RECT {
+                                left: fx + text_width(hdc, &row.figure),
+                                ..figure_rect
+                            },
+                            pace,
+                            &blend(bg, *color, text_a),
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                        );
+                    }
                     if let Some((reset, color)) = row.reset {
-                        let rx = fx + px(FIGURE_W as f64);
+                        let rx = fx + px(figure_w as f64);
                         SelectObject(hdc, time_font);
                         draw_text_in(
                             hdc,
@@ -2848,36 +2872,6 @@ fn compose_docked(
                             reset,
                             &blend(bg, color, text_a),
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                        );
-                    }
-                    if let Some(pace) = &row.pace {
-                        let lx = fx + px(FIGURE_W as f64) + px(RESET_W as f64);
-                        let vx = lx + px(PACE_LABEL_W as f64);
-                        SelectObject(hdc, label_font);
-                        draw_text_in(
-                            hdc,
-                            RECT {
-                                left: lx,
-                                top,
-                                right: vx,
-                                bottom,
-                            },
-                            pace.label,
-                            &blend(bg, pace.label_color, text_a),
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                        );
-                        SelectObject(hdc, time_font);
-                        draw_text_in(
-                            hdc,
-                            RECT {
-                                left: vx,
-                                top,
-                                right: lx + px(PACE_W as f64),
-                                bottom,
-                            },
-                            &pace.figure,
-                            &blend(bg, pace.figure_color, text_a),
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                         );
                     }
                 }
@@ -2988,14 +2982,13 @@ fn compose_docked(
 /// plans without that limit, leaves the weekly window alone on the outer ring
 /// with its row centred beside it. `stale` dims the usage rings and says so
 /// in place of the countdown, for a reading that has stopped updating. The
-/// weekly row ends with its pace, labelled `pace_label`.
+/// weekly row's percentage reads as its usage over its pace.
 #[allow(clippy::too_many_arguments)]
 fn ring_readings<'a>(
     frame: &LiveFrame,
     texts: [&'a str; 2],
     paces: [Option<f64>; 2],
     labels: [&'a str; 2],
-    pace_label: &'a str,
     is_dark: bool,
     bg: Color,
     breath: f64,
@@ -3081,12 +3074,9 @@ fn ring_readings<'a>(
             figure: readout::figure(pct, texts[slot]),
             figure_color,
             reset: Some((reset, blend(ink, lift, 0.55 * frame.text_tick))),
-            pace: tick.filter(|_| slot == 1).map(|p| RowPace {
-                label: pace_label,
-                label_color: tick_color,
-                figure: format!("{:.0}%", p.clamp(0.0, 100.0)),
-                figure_color: ink,
-            }),
+            pace: tick
+                .filter(|_| slot == 1)
+                .map(|p| (format!(" / {:.0}%", p.clamp(0.0, 100.0)), tick_color)),
         };
         let band = RingBand {
             percent: if reading { pct } else { 0.0 },
@@ -3267,14 +3257,16 @@ fn paint_content(
             [texts[0], texts[1]],
             [session_pace, weekly_pace],
             [strings.session_window, strings.weekly_window],
-            strings.pace,
             is_dark,
             *bg,
             breath,
             stale,
         );
 
-        for (ring_x, bands) in [(USAGE_X, &usage_bands), (SYSTEM_X, &system_bands)] {
+        for (ring_x, bands, figure_w) in [
+            (USAGE_X, &usage_bands, USAGE_FIGURE_W),
+            (SYSTEM_X, &system_bands, FIGURE_W),
+        ] {
             let x = widget_sc(ring_x);
             draw_rings(
                 hdc,
@@ -3304,21 +3296,34 @@ fn paint_content(
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
                 let fx = tx + widget_sc(LABEL_W);
+                let figure_rect = RECT {
+                    left: fx,
+                    top,
+                    right: fx + widget_sc(figure_w),
+                    bottom,
+                };
                 SelectObject(hdc, figure_font);
                 draw_text_in(
                     hdc,
-                    RECT {
-                        left: fx,
-                        top,
-                        right: fx + widget_sc(FIGURE_W),
-                        bottom,
-                    },
+                    figure_rect,
                     &row.figure,
                     &row.figure_color,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
+                if let Some((pace, color)) = &row.pace {
+                    draw_text_in(
+                        hdc,
+                        RECT {
+                            left: fx + text_width(hdc, &row.figure),
+                            ..figure_rect
+                        },
+                        pace,
+                        color,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+                    );
+                }
                 if let Some((reset, color)) = row.reset {
-                    let rx = fx + widget_sc(FIGURE_W);
+                    let rx = fx + widget_sc(figure_w);
                     SelectObject(hdc, time_font);
                     draw_text_in(
                         hdc,
@@ -3331,36 +3336,6 @@ fn paint_content(
                         reset,
                         &color,
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                    );
-                }
-                if let Some(pace) = &row.pace {
-                    let lx = fx + widget_sc(FIGURE_W) + widget_sc(RESET_W);
-                    let vx = lx + widget_sc(PACE_LABEL_W);
-                    SelectObject(hdc, label_font);
-                    draw_text_in(
-                        hdc,
-                        RECT {
-                            left: lx,
-                            top,
-                            right: vx,
-                            bottom,
-                        },
-                        pace.label,
-                        &pace.label_color,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                    );
-                    SelectObject(hdc, time_font);
-                    draw_text_in(
-                        hdc,
-                        RECT {
-                            left: vx,
-                            top,
-                            right: lx + widget_sc(PACE_W),
-                            bottom,
-                        },
-                        &pace.figure,
-                        &pace.figure_color,
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
                 }
             }
@@ -4070,8 +4045,8 @@ mod desktop_tests {
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 100), 62);
         assert_eq!(scale_px(WIDGET_HEIGHT, 96, 200), 124);
         assert_eq!(scale_px(WIDGET_HEIGHT, 144, 200), 186);
-        assert_eq!(widget_width_at(96, 100), 360);
-        assert_eq!(widget_width_at(96, 200), 720);
+        assert_eq!(widget_width_at(96, 100), 350);
+        assert_eq!(widget_width_at(96, 200), 700);
         assert_eq!(widget_width_at(192, 100), widget_width_at(96, 200));
     }
 
@@ -5038,6 +5013,12 @@ struct RingBand {
 /// The figures beside a ring, one row per band: a label, the percentage, and
 /// on usage rows the time to reset. The label takes its ring's colour, so the
 /// rows double as the key to which ring is which.
+///
+/// `pace` follows the weekly row's percentage in the same font, as ` / 65%`
+/// in the tick's colour: where an even spend across the window would have put
+/// it by now, the percentage the ring's tick marks, so the row reads as usage
+/// over pace and how far ahead of or behind that the week is reads exactly.
+/// Present only while the tick is drawn.
 struct RingRow<'a> {
     y: i32,
     label: &'a str,
@@ -5045,18 +5026,17 @@ struct RingRow<'a> {
     figure: String,
     figure_color: Color,
     reset: Option<(&'a str, Color)>,
-    pace: Option<RowPace<'a>>,
+    pace: Option<(String, Color)>,
 }
 
-/// The weekly row's pace: where an even spend across the window would have
-/// put it by now, which is the percentage its ring's tick marks, so how far
-/// ahead of or behind that the week is reads exactly. Present only while the
-/// tick is drawn. The label takes the tick's colour.
-struct RowPace<'a> {
-    label: &'a str,
-    label_color: Color,
-    figure: String,
-    figure_color: Color,
+/// The width of `text` in the font selected into `hdc`.
+fn text_width(hdc: HDC, text: &str) -> i32 {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    unsafe {
+        let _ = GetTextExtentPoint32W(hdc, &wide, &mut size);
+    }
+    size.cx
 }
 
 /// Pixel coverage for a distance inside an edge, ramped over one pixel.
