@@ -11,9 +11,9 @@ widget itself:
 - **Usage** (left): the 5h window on the outer ring and the 7d window on the
   inner ring, each with its **percentage used** and reset countdown. A short
   tick across a ring marks where an even spend would have put you; a ring turns
-  amber, then red, when it runs high or well ahead of that pace. The 7d
-  figure reads as usage over that pace, `58% / 65%`, so how far ahead of or
-  behind it the week is reads exactly. On a plan with
+  amber, then red, as it runs further ahead of that pace, however low or high
+  its percentage is. The 7d figure reads as usage over that pace, `58% / 65%`,
+  so how far ahead of or behind it the week is reads exactly. On a plan with
   no 5h limit the usage response carries no 5h window, so the 7d window takes
   the outer ring alone, and the tray badge shows the 7d figure instead. This
   follows the response, not a setting: each account shows the windows it has.
@@ -70,8 +70,8 @@ preview uses explicitly labelled sample usage. **Undo changes** restores the
 appearance from when the studio opened; **Reset** restores System mode, the
 default custom palette and 100% widget size. **Done**, Escape or the close button
 closes the studio without quitting the monitor. Controls support Tab and Space,
-and the slider also takes the arrow keys and PageUp/PageDown. High-usage warning
-gauges retain their amber/red semantic colors. Customization applies to the
+and the slider also takes the arrow keys and PageUp/PageDown. Warning gauges
+retain their amber/red semantic colors. Customization applies to the
 widget, not the Windows shell's notification-area icon badges.
 
 The widget is collapsed to just its rings and docked on an outer edge of your

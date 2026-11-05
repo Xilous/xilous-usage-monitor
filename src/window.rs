@@ -1610,12 +1610,13 @@ fn lerp_led(a: &Led, b: &Led, t: f64) -> Led {
 }
 
 /// How a usage row is coloured. `burn` is how far ahead of an even spend the
-/// reading is, so a window that will run out early goes warm well before it is
-/// numerically high - which is the whole point of showing pace at all.
-fn state_led(percent: f64, burn: f64, base: &Led) -> Led {
-    if percent >= 90.0 || burn >= 18.0 {
+/// reading is, and that alone sets the colour: a window that will run out
+/// early goes warm however low it reads, and one on pace stays calm however
+/// high it reads. A window with no pace has no burn, so it stays calm too.
+fn state_led(burn: f64, base: &Led) -> Led {
+    if burn >= 18.0 {
         hot_led()
-    } else if percent >= 70.0 || burn >= 8.0 {
+    } else if burn >= 8.0 {
         warm_led()
     } else {
         *base
@@ -3058,7 +3059,7 @@ fn ring_readings<'a>(
         let tick = pace.filter(|_| reading);
         let tick_color = blend(pace_marker_color(is_dark), bg, 0.35);
         let burn = pace.map(|p| pct - p).unwrap_or(0.0);
-        let led = tone(state_led(pct, burn, &base), inner);
+        let led = tone(state_led(burn, &base), inner);
         let mut fill = blend(led.mid, led.core, 0.10 + 0.25 * breath);
         let mut figure_color = figure_ink(&led, frame.flash);
         let mut reset = readout::reset_label(texts[slot]);
@@ -4084,6 +4085,92 @@ mod desktop_tests {
         assert!(!settings.show_codex);
         let saved = serde_json::to_string(&settings).unwrap();
         assert!(!saved.contains("language"));
+    }
+}
+
+#[cfg(test)]
+mod usage_ring_colour_tests {
+    use super::*;
+
+    const WEEKLY_ONLY: [&str; 2] = ["n/a", "3d 4h"];
+    const BOTH_WINDOWS: [&str; 2] = ["2h 10m", "3d 4h"];
+
+    /// The colour of each usage ring, outer ring first, read off its row's
+    /// label, which on the dark theme is the ring's own colour.
+    fn ring_colours(
+        texts: [&str; 2],
+        percents: [f64; 2],
+        paces: [Option<f64>; 2],
+    ) -> [Option<u32>; 2] {
+        let frame = LiveFrame {
+            shown: [percents[0], percents[1], 0.0, 0.0, 0.0, 0.0, 0.0],
+            cpu: 0.0,
+            ram: 0.0,
+            flash: 0.0,
+            text_tick: 0.0,
+            poll_frac: 0.0,
+        };
+        let [usage, _] = ring_readings(
+            &frame,
+            texts,
+            paces,
+            ["5h", "7d"],
+            true,
+            Color::from_hex("#1C1C1C"),
+            0.0,
+            false,
+        );
+        usage.map(|ring| ring.map(|(_, row)| row.label_color.to_colorref()))
+    }
+
+    /// The colour of the weekly ring alone.
+    fn weekly_colour(percent: f64, pace: Option<f64>) -> u32 {
+        ring_colours(WEEKLY_ONLY, [0.0, percent], [None, pace])[0].unwrap()
+    }
+
+    fn calm() -> u32 {
+        claude_led().mid.to_colorref()
+    }
+
+    fn amber() -> u32 {
+        warm_led().mid.to_colorref()
+    }
+
+    fn red() -> u32 {
+        hot_led().mid.to_colorref()
+    }
+
+    #[test]
+    fn a_high_reading_on_or_behind_pace_stays_calm() {
+        assert_eq!(weekly_colour(72.0, Some(72.0)), calm());
+        assert_eq!(weekly_colour(95.0, Some(96.0)), calm());
+        assert_eq!(weekly_colour(100.0, Some(100.0)), calm());
+    }
+
+    #[test]
+    fn a_low_reading_well_ahead_of_pace_warms() {
+        assert_eq!(weekly_colour(12.0, Some(4.0)), amber());
+        assert_eq!(weekly_colour(22.0, Some(4.0)), red());
+    }
+
+    #[test]
+    fn colour_changes_at_the_burn_limits() {
+        assert_eq!(weekly_colour(57.9, Some(50.0)), calm());
+        assert_eq!(weekly_colour(58.0, Some(50.0)), amber());
+        assert_eq!(weekly_colour(67.9, Some(50.0)), amber());
+        assert_eq!(weekly_colour(68.0, Some(50.0)), red());
+    }
+
+    #[test]
+    fn with_no_pace_a_reading_stays_calm_however_high_it_is() {
+        assert_eq!(weekly_colour(99.0, None), calm());
+    }
+
+    #[test]
+    fn each_ring_goes_by_its_own_pace() {
+        let [session, weekly] = ring_colours(BOTH_WINDOWS, [95.0, 30.0], [Some(90.0), Some(5.0)]);
+        assert_eq!(session, Some(calm()));
+        assert_eq!(weekly, Some(deeper(hot_led().mid).to_colorref()));
     }
 }
 
