@@ -536,11 +536,27 @@ fn fable_readout_from_state(s: &AppState) -> (f64, String) {
     }
 }
 
+/// The Fable reading for its ring. Only an account whose last Claude reading
+/// carried a Fable quota gets the ring, so a plan without one never grows a
+/// third ring while it waits or goes offline; it reads as not reported.
+fn fable_ring_readout_from_state(s: &AppState) -> (f64, String) {
+    let reported = s
+        .data
+        .as_ref()
+        .and_then(|data| data.claude_code.as_ref())
+        .is_some_and(|usage| usage.fable.available);
+    if reported {
+        fable_readout_from_state(s)
+    } else {
+        (0.0, "n/a".to_owned())
+    }
+}
+
 fn fable_readout() -> (f64, String) {
     lock_state()
         .as_ref()
-        .map(fable_readout_from_state)
-        .unwrap_or_else(|| (0.0, "...".to_owned()))
+        .map(fable_ring_readout_from_state)
+        .unwrap_or_else(|| (0.0, "n/a".to_owned()))
 }
 
 fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
@@ -1317,12 +1333,18 @@ pub(crate) const SPLIT_H: i32 = 34;
 /// percentage its ring's tick marks: `100% / 100%` at the widest.
 pub(crate) const TEXT_DX: i32 = 58;
 pub(crate) const LABEL_W: i32 = 24;
+/// The usage rows' labels run to `Fable`, so their column takes a little of
+/// the reset column, which never needs all of it.
+pub(crate) const USAGE_LABEL_W: i32 = 29;
 pub(crate) const FIGURE_W: i32 = 34;
 pub(crate) const USAGE_FIGURE_W: i32 = 74;
-pub(crate) const RESET_W: i32 = 46;
+pub(crate) const RESET_W: i32 = 41;
 const ROW1_Y: i32 = 15;
 const ROW2_Y: i32 = 33;
 const ROW_H: i32 = 14;
+/// The usage rows when the Fable ring joins the other two: three rows centred
+/// on the rings, the middle one level with their centre.
+const ROW3_YS: [i32; 3] = [5, 24, 43];
 
 /// How often the live CPU and RAM readings are sampled. The paint eases toward
 /// whatever this last stored, so the rings drift continuously between samples.
@@ -1345,13 +1367,16 @@ fn pace_percent(resets_at: Option<SystemTime>, window: Duration) -> Option<f64> 
     Some((1.0 - remaining.as_secs_f64() / window.as_secs_f64()) * 100.0)
 }
 
-fn claude_pace_markers(data: Option<&AppUsageData>) -> (Option<f64>, Option<f64>) {
+/// The pace of each usage ring, outer first: the five-hour window, the weekly
+/// one, then the weekly Fable quota, which keeps its own reset time.
+fn claude_pace_markers(data: Option<&AppUsageData>) -> [Option<f64>; 3] {
     match data.and_then(|d| d.claude_code.as_ref()) {
-        Some(usage) => (
+        Some(usage) => [
             pace_percent(usage.session.resets_at, SESSION_WINDOW),
             pace_percent(usage.weekly.resets_at, WEEKLY_WINDOW),
-        ),
-        None => (None, None),
+            pace_percent(usage.fable.resets_at, WEEKLY_WINDOW),
+        ],
+        None => [None, None, None],
     }
 }
 
@@ -1519,6 +1544,17 @@ fn claude_led() -> Led {
         mid: Color::from_hex("#22D3EE"),
         core: Color::from_hex("#EAFCFF"),
         glow: Color::from_hex("#38BDF8"),
+    }
+}
+
+/// The Fable ring: a violet, a cool neighbour of the cyan 5h and 7d rings so it
+/// reads as one more Claude quota, yet plainly not either of them.
+fn fable_led() -> Led {
+    Led {
+        edge: Color::from_hex("#5B21B6"),
+        mid: Color::from_hex("#A78BFA"),
+        core: Color::from_hex("#F3EEFF"),
+        glow: Color::from_hex("#8B5CF6"),
     }
 }
 
@@ -2138,6 +2174,7 @@ fn render_layered() {
         session_pct,
         session_pace,
         weekly_pace,
+        fable_pace,
         session_text,
         weekly_pct,
         weekly_text,
@@ -2157,7 +2194,7 @@ fn render_layered() {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => {
-                let (session_pace, weekly_pace) = claude_pace_markers(s.data.as_ref());
+                let [session_pace, weekly_pace, fable_pace] = claude_pace_markers(s.data.as_ref());
                 (
                     s.hwnd,
                     s.is_dark,
@@ -2166,6 +2203,7 @@ fn render_layered() {
                     s.session_percent,
                     session_pace,
                     weekly_pace,
+                    fable_pace,
                     s.session_text.clone(),
                     s.weekly_percent,
                     s.weekly_text.clone(),
@@ -2273,6 +2311,7 @@ fn render_layered() {
             &codex_accent,
             &antigravity_accent,
             fable_readout(),
+            fable_pace,
             stale,
         );
 
@@ -2512,6 +2551,7 @@ fn render_docked(hwnd: HWND) {
         session_text,
         weekly_text,
         paces,
+        fable,
         poll_interval_ms,
         visible,
         click_through,
@@ -2521,14 +2561,16 @@ fn render_docked(hwnd: HWND) {
         let Some(s) = state.as_ref() else {
             return;
         };
-        let (session_pace, weekly_pace) = claude_pace_markers(s.data.as_ref());
+        let paces = claude_pace_markers(s.data.as_ref());
+        let fable = fable_ring_readout_from_state(s);
         (
             s.is_dark,
             s.session_percent,
             s.weekly_percent,
             s.session_text.clone(),
             s.weekly_text.clone(),
-            [session_pace, weekly_pace],
+            paces,
+            fable,
             s.poll_interval_ms,
             s.widget_visible,
             s.click_through,
@@ -2592,8 +2634,8 @@ fn render_docked(hwnd: HWND) {
     }
 
     let live = step_anim(
-        &[session_pct, weekly_pct, 0.0, 0.0, 0.0, 0.0, 0.0],
-        &[&session_text, &weekly_text, "", "", "", "", ""],
+        &[session_pct, weekly_pct, 0.0, 0.0, 0.0, 0.0, fable.0],
+        &[&session_text, &weekly_text, "", "", "", "", &fable.1],
         last_cpu_sample(),
         last_ram_sample(),
         poll_interval_ms,
@@ -2633,7 +2675,7 @@ fn render_docked(hwnd: HWND) {
             &frame,
             &live,
             is_dark,
-            [&session_text, &weekly_text],
+            [&session_text, &weekly_text, &fable.1],
             paces,
             stale,
         );
@@ -2687,8 +2729,8 @@ fn compose_docked(
     frame: &dock::Frame,
     live: &LiveFrame,
     is_dark: bool,
-    texts: [&str; 2],
-    paces: [Option<f64>; 2],
+    texts: [&str; 3],
+    paces: [Option<f64>; 3],
     stale: bool,
 ) {
     let palette = appearance().palette(is_dark);
@@ -2705,7 +2747,11 @@ fn compose_docked(
         live,
         texts,
         paces,
-        [strings.session_window, strings.weekly_window],
+        [
+            strings.session_window,
+            strings.weekly_window,
+            strings.fable_window,
+        ],
         is_dark,
         bg,
         anim_breath(),
@@ -2802,6 +2848,7 @@ fn compose_docked(
                     l.usage[1],
                     &readings[0],
                     clips[0],
+                    USAGE_LABEL_W,
                     USAGE_FIGURE_W,
                 ),
                 (
@@ -2809,10 +2856,11 @@ fn compose_docked(
                     l.device[1],
                     &readings[1],
                     clips[1],
+                    LABEL_W,
                     FIGURE_W,
                 ),
             ];
-            for (text_x, ring_y, rows, clip, figure_w) in blocks {
+            for (text_x, ring_y, rows, clip, label_w, figure_w) in blocks {
                 let saved = SaveDC(hdc);
                 let _ = IntersectClipRect(hdc, px(clip[0]), px(clip[1]), px(clip[2]), px(clip[3]));
                 let tx = px(text_x + slide);
@@ -2825,14 +2873,14 @@ fn compose_docked(
                         RECT {
                             left: tx,
                             top,
-                            right: tx + px(LABEL_W as f64),
+                            right: tx + px(label_w as f64),
                             bottom,
                         },
                         row.label,
                         &blend(bg, row.label_color, text_a),
                         DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                     );
-                    let fx = tx + px(LABEL_W as f64);
+                    let fx = tx + px(label_w as f64);
                     let figure_rect = RECT {
                         left: fx,
                         top,
@@ -2978,23 +3026,25 @@ fn compose_docked(
 }
 
 /// The ring bands and their figure rows, outer ring first: usage (the
-/// five-hour window outside, the weekly one inside), then the device (CPU
-/// outside, RAM inside). A Claude reading with no five-hour window, as on
-/// plans without that limit, leaves the weekly window alone on the outer ring
-/// with its row centred beside it. `stale` dims the usage rings and says so
-/// in place of the countdown, for a reading that has stopped updating. The
-/// weekly row's percentage reads as its usage over its pace.
+/// five-hour window outside, the weekly one inside it, and the Fable quota
+/// innermost), then the device (CPU outside, RAM inside). A Claude reading
+/// with no five-hour window, as on plans without that limit, moves the rings
+/// inside it outward, and one with no Fable quota leaves the Fable ring out;
+/// the rows are centred beside whichever rings remain. `stale` dims the usage
+/// rings and says so in place of the countdown, for a reading that has
+/// stopped updating. The weekly and Fable rows' percentages read as usage
+/// over pace.
 #[allow(clippy::too_many_arguments)]
 fn ring_readings<'a>(
     frame: &LiveFrame,
-    texts: [&'a str; 2],
-    paces: [Option<f64>; 2],
-    labels: [&'a str; 2],
+    texts: [&'a str; 3],
+    paces: [Option<f64>; 3],
+    labels: [&'a str; 3],
     is_dark: bool,
     bg: Color,
     breath: f64,
     stale: bool,
-) -> [[Option<(RingBand, RingRow<'a>)>; 2]; 2] {
+) -> [[Option<(RingBand, RingRow<'a>)>; 3]; 2] {
     let appearance = appearance();
     let palette = appearance.palette(is_dark);
     let custom = appearance.mode == Mode::Custom;
@@ -3042,24 +3092,46 @@ fn ring_readings<'a>(
     } else {
         claude_led()
     };
+    let fable = fable_led();
+    // Which windows get a ring, outer first, and the rows beside them.
     let weekly_only = texts[0] == "n/a" && readout::has_reading(texts[1]);
-    let usage = if weekly_only {
-        [Some((1usize, (ROW1_Y + ROW2_Y) / 2)), None]
-    } else {
-        [Some((0usize, ROW1_Y)), Some((1usize, ROW2_Y))]
+    let with_fable = texts[2] != "n/a";
+    let slots: Vec<usize> = [(0usize, !weekly_only), (1, true), (2, with_fable)]
+        .into_iter()
+        .filter_map(|(slot, shown)| shown.then_some(slot))
+        .collect();
+    let rows: &[i32] = match slots.len() {
+        3 => &ROW3_YS,
+        2 => &[ROW1_Y, ROW2_Y],
+        _ => &[(ROW1_Y + ROW2_Y) / 2],
     };
+    // Where each window's percentage sits in the animated figures.
+    const SHOWN: [usize; 3] = [0, 1, 6];
+    let usage: [Option<(usize, i32)>; 3] =
+        std::array::from_fn(|i| slots.get(i).map(|&slot| (slot, rows[i])));
     let mut ring = 0;
     let usage_bands = usage.map(|slot| {
         let (slot, row_y) = slot?;
-        let inner = ring == 1;
+        let depth = ring;
         ring += 1;
-        let pct = frame.shown[slot].clamp(0.0, 100.0);
+        let pct = frame.shown[SHOWN[slot]].clamp(0.0, 100.0);
         let reading = readout::has_reading(texts[slot]);
         let pace = paces[slot];
         let tick = pace.filter(|_| reading);
         let tick_color = blend(pace_marker_color(is_dark), bg, 0.35);
         let burn = pace.map(|p| pct - p).unwrap_or(0.0);
-        let led = tone(state_led(burn, &base), inner);
+        // The Fable ring has its own hue while calm, so it never reads as a
+        // third shade of the weekly window it shares a length with. On a
+        // custom palette, which has one accent, it is that accent deeper still.
+        let own_hue = slot == 2 && !custom;
+        let led = state_led(burn, if own_hue { &fable } else { &base });
+        let led = match depth {
+            0 => led,
+            1 if !own_hue => deeper_led(&led),
+            1 => led,
+            _ if own_hue => led,
+            _ => deeper_led(&deeper_led(&led)),
+        };
         let mut fill = blend(led.mid, led.core, 0.10 + 0.25 * breath);
         let mut figure_color = figure_ink(&led, frame.flash);
         let mut reset = readout::reset_label(texts[slot]);
@@ -3076,7 +3148,7 @@ fn ring_readings<'a>(
             figure_color,
             reset: Some((reset, blend(ink, lift, 0.55 * frame.text_tick))),
             pace: tick
-                .filter(|_| slot == 1)
+                .filter(|_| slot != 0)
                 .map(|p| (format!(" / {:.0}%", p.clamp(0.0, 100.0)), tick_color)),
         };
         let band = RingBand {
@@ -3095,7 +3167,10 @@ fn ring_readings<'a>(
         ("CPU", frame.cpu, ROW1_Y, false),
         ("RAM", frame.ram, ROW2_Y, true),
     ];
-    let system_bands = system.map(|(label, value, row_y, inner)| {
+    let mut system = system.into_iter();
+    let system: [_; 3] = std::array::from_fn(|_| system.next());
+    let system_bands = system.map(|ring| {
+        let (label, value, row_y, inner) = ring?;
         let value = value.clamp(0.0, 100.0);
         let led = tone(load_led(value), inner);
         let row = RingRow {
@@ -3151,6 +3226,7 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
     fable: (f64, String),
+    fable_pace: Option<f64>,
     stale: bool,
 ) {
     let poll_interval_ms = {
@@ -3161,9 +3237,9 @@ fn paint_content(
             .unwrap_or(POLL_1_MIN)
     };
 
-    // The widget shows one provider's 5h and 7d windows and the device rings.
-    // The bar-era accents, the other providers, the Fable row and the day band
-    // drive nothing any more; the paint entrypoints still compute and pass them.
+    // The widget shows one provider's 5h, 7d and Fable windows and the device
+    // rings. The bar-era accents, the other providers and the day band drive
+    // nothing any more; the paint entrypoints still compute and pass them.
     let _ = (accent, codex_accent, antigravity_accent, track);
     let _ = (show_claude_code, show_codex, show_antigravity);
 
@@ -3255,18 +3331,22 @@ fn paint_content(
 
         let [usage_bands, system_bands] = ring_readings(
             &frame,
-            [texts[0], texts[1]],
-            [session_pace, weekly_pace],
-            [strings.session_window, strings.weekly_window],
+            [texts[0], texts[1], texts[6]],
+            [session_pace, weekly_pace, fable_pace],
+            [
+                strings.session_window,
+                strings.weekly_window,
+                strings.fable_window,
+            ],
             is_dark,
             *bg,
             breath,
             stale,
         );
 
-        for (ring_x, bands, figure_w) in [
-            (USAGE_X, &usage_bands, USAGE_FIGURE_W),
-            (SYSTEM_X, &system_bands, FIGURE_W),
+        for (ring_x, bands, label_w, figure_w) in [
+            (USAGE_X, &usage_bands, USAGE_LABEL_W, USAGE_FIGURE_W),
+            (SYSTEM_X, &system_bands, LABEL_W, FIGURE_W),
         ] {
             let x = widget_sc(ring_x);
             draw_rings(
@@ -3289,14 +3369,14 @@ fn paint_content(
                     RECT {
                         left: tx,
                         top,
-                        right: tx + widget_sc(LABEL_W),
+                        right: tx + widget_sc(label_w),
                         bottom,
                     },
                     row.label,
                     &row.label_color,
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE,
                 );
-                let fx = tx + widget_sc(LABEL_W);
+                let fx = tx + widget_sc(label_w);
                 let figure_rect = RECT {
                     left: fx,
                     top,
@@ -4092,18 +4172,17 @@ mod desktop_tests {
 mod usage_ring_colour_tests {
     use super::*;
 
-    const WEEKLY_ONLY: [&str; 2] = ["n/a", "3d 4h"];
-    const BOTH_WINDOWS: [&str; 2] = ["2h 10m", "3d 4h"];
+    const WEEKLY_ONLY: [&str; 3] = ["n/a", "3d 4h", "n/a"];
+    const BOTH_WINDOWS: [&str; 3] = ["2h 10m", "3d 4h", "n/a"];
+    const WITH_FABLE: [&str; 3] = ["2h 10m", "3d 4h", "5d 2h"];
 
-    /// The colour of each usage ring, outer ring first, read off its row's
-    /// label, which on the dark theme is the ring's own colour.
-    fn ring_colours(
-        texts: [&str; 2],
-        percents: [f64; 2],
-        paces: [Option<f64>; 2],
-    ) -> [Option<u32>; 2] {
+    fn readings(
+        texts: [&str; 3],
+        percents: [f64; 3],
+        paces: [Option<f64>; 3],
+    ) -> [Option<(RingBand, RingRow<'_>)>; 3] {
         let frame = LiveFrame {
-            shown: [percents[0], percents[1], 0.0, 0.0, 0.0, 0.0, 0.0],
+            shown: [percents[0], percents[1], 0.0, 0.0, 0.0, 0.0, percents[2]],
             cpu: 0.0,
             ram: 0.0,
             flash: 0.0,
@@ -4114,18 +4193,29 @@ mod usage_ring_colour_tests {
             &frame,
             texts,
             paces,
-            ["5h", "7d"],
+            ["5h", "7d", "Fable"],
             true,
             Color::from_hex("#1C1C1C"),
             0.0,
             false,
         );
-        usage.map(|ring| ring.map(|(_, row)| row.label_color.to_colorref()))
+        usage
+    }
+
+    /// The colour of each usage ring, outer ring first, read off its row's
+    /// label, which on the dark theme is the ring's own colour.
+    fn ring_colours(
+        texts: [&str; 3],
+        percents: [f64; 3],
+        paces: [Option<f64>; 3],
+    ) -> [Option<u32>; 3] {
+        readings(texts, percents, paces)
+            .map(|ring| ring.map(|(_, row)| row.label_color.to_colorref()))
     }
 
     /// The colour of the weekly ring alone.
     fn weekly_colour(percent: f64, pace: Option<f64>) -> u32 {
-        ring_colours(WEEKLY_ONLY, [0.0, percent], [None, pace])[0].unwrap()
+        ring_colours(WEEKLY_ONLY, [0.0, percent, 0.0], [None, pace, None])[0].unwrap()
     }
 
     fn calm() -> u32 {
@@ -4168,9 +4258,58 @@ mod usage_ring_colour_tests {
 
     #[test]
     fn each_ring_goes_by_its_own_pace() {
-        let [session, weekly] = ring_colours(BOTH_WINDOWS, [95.0, 30.0], [Some(90.0), Some(5.0)]);
+        let [session, weekly, fable] = ring_colours(
+            BOTH_WINDOWS,
+            [95.0, 30.0, 0.0],
+            [Some(90.0), Some(5.0), None],
+        );
         assert_eq!(session, Some(calm()));
         assert_eq!(weekly, Some(deeper(hot_led().mid).to_colorref()));
+        assert_eq!(fable, None);
+    }
+
+    #[test]
+    fn fable_takes_the_innermost_ring_in_its_own_colour() {
+        let rings = readings(
+            WITH_FABLE,
+            [20.0, 40.0, 38.0],
+            [Some(20.0), Some(40.0), Some(41.0)],
+        );
+        let labels = rings
+            .each_ref()
+            .map(|r| r.as_ref().map(|(_, row)| row.label));
+        assert_eq!(labels, [Some("5h"), Some("7d"), Some("Fable")]);
+        let (band, row) = rings[2].as_ref().unwrap();
+        assert_eq!(band.percent, 38.0);
+        assert_eq!(row.label_color.to_colorref(), fable_led().mid.to_colorref());
+        assert_eq!(row.figure, "38%");
+        assert_eq!(row.pace.as_ref().map(|(p, _)| p.as_str()), Some(" / 41%"));
+        // Three rows, centred beside the rings.
+        let ys = rings.each_ref().map(|r| r.as_ref().map(|(_, row)| row.y));
+        assert_eq!(ys, [Some(5), Some(24), Some(43)]);
+    }
+
+    #[test]
+    fn fable_ahead_of_pace_warms_like_the_others() {
+        let [_, _, fable] = ring_colours(
+            WITH_FABLE,
+            [20.0, 40.0, 60.0],
+            [Some(20.0), Some(40.0), Some(41.0)],
+        );
+        assert_eq!(fable, Some(red()));
+    }
+
+    #[test]
+    fn fable_without_a_five_hour_window_moves_out_a_ring() {
+        let rings = readings(
+            ["n/a", "3d 4h", "5d 2h"],
+            [0.0, 40.0, 38.0],
+            [None, Some(40.0), Some(41.0)],
+        );
+        let labels = rings
+            .each_ref()
+            .map(|r| r.as_ref().map(|(_, row)| row.label));
+        assert_eq!(labels, [Some("7d"), Some("Fable"), None]);
     }
 }
 
@@ -5166,7 +5305,7 @@ impl Premul {
     }
 }
 
-/// Two concentric ring gauges in a `d`-pixel square, outer band first, each
+/// Up to three concentric ring gauges in a `d`-pixel square, outer band first, each
 /// filling clockwise from twelve o'clock with round caps, as premultiplied
 /// pixels with nothing behind them. `shadow` lays a soft dark band of that
 /// opacity under each ring, which keeps them legible over a busy desktop.
@@ -5177,7 +5316,7 @@ fn ring_pixels(
     d: i32,
     stroke: f64,
     gap: f64,
-    bands: [Option<&RingBand>; 2],
+    bands: [Option<&RingBand>; 3],
     shadow: f64,
 ) -> Vec<Premul> {
     let mut pixels = vec![Premul::default(); (d.max(0) * d.max(0)) as usize];
@@ -5191,8 +5330,12 @@ fn ring_pixels(
     // Per band, outer first: its centre-line radius, how far round it fills,
     // where the fill's end cap sits, and the pace tick's direction. A missing
     // band (the usage block with only a weekly window) draws nothing at all.
-    let mids = [c - half, c - half - stroke - gap];
-    let geometry: Vec<_> = (0..2)
+    let mids = [
+        c - half,
+        c - half - stroke - gap,
+        c - half - 2.0 * (stroke + gap),
+    ];
+    let geometry: Vec<_> = (0..3)
         .filter_map(|i| {
             let band = bands[i]?;
             let mid = mids[i];
@@ -5267,7 +5410,7 @@ fn draw_rings(
     d: i32,
     stroke: f64,
     gap: f64,
-    bands: [Option<&RingBand>; 2],
+    bands: [Option<&RingBand>; 3],
     bg: Color,
 ) {
     if d <= 0 {
@@ -5392,7 +5535,8 @@ pub fn write_preview(
             false,
             &codex_accent_color(dark),
             &antigravity_accent_color(),
-            (38.0, if unavailable { "n/a" } else { "4d 8h" }.to_owned()),
+            (38.0, if unavailable { "n/a" } else { "5d 2h" }.to_owned()),
+            Some(41.0),
             stale,
         );
         let _ = GdiFlush();
@@ -5450,7 +5594,7 @@ pub fn write_docked_preview(
             0.0,
             0.0,
             0.0,
-            0.0,
+            38.0,
         ],
         cpu: 18.0,
         ram: 42.0,
@@ -5490,8 +5634,8 @@ pub fn write_docked_preview(
             &frame,
             &live,
             dark,
-            [if no_session { "n/a" } else { "3h 12m" }, "4d 8h"],
-            [(!no_session).then_some(45.0), Some(65.0)],
+            [if no_session { "n/a" } else { "3h 12m" }, "4d 8h", "5d 2h"],
+            [(!no_session).then_some(45.0), Some(65.0), Some(41.0)],
             stale,
         );
         let out = pixels.to_vec();

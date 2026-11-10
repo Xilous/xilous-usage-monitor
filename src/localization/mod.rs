@@ -34,6 +34,7 @@ pub struct Strings {
     /// drawn inside the seven blocks of the weekly bar.
     pub session_window: &'static str,
     pub weekly_window: &'static str,
+    pub fable_window: &'static str,
     pub now: &'static str,
     pub day_suffix: &'static str,
     pub hour_suffix: &'static str,
