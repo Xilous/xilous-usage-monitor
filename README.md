@@ -15,7 +15,10 @@ widget itself:
   its percentage is. The 7d figure reads as usage over that pace, `58% / 65%`,
   so how far ahead of or behind it the week is reads exactly. On a plan with
   no 5h limit the usage response carries no 5h window, so the 7d window takes
-  the outer ring alone, and the tray badge shows the 7d figure instead. This
+  the outer ring, and the tray badge shows the 7d figure instead. When the
+  response carries the model-specific **Fable** quota, it takes a third,
+  innermost ring in violet, read the same way as the 7d one (`38% / 41%`
+  against its own reset time); an account without it shows two rings. This
   follows the response, not a setting: each account shows the windows it has.
 - **Device** (right): CPU load on the outer ring and RAM in use on the inner
   ring. Both shift from green through amber to red as headroom runs out.
@@ -25,8 +28,8 @@ each row's label is drawn in its ring's colour, so the rows double as the key.
 
 The widget shows Claude Code only. Codex and Antigravity are no longer shown or
 polled, and any provider choices saved by an older version load as Claude Code
-only. The Claude tray tooltip still includes the model-specific **Fable** quota,
-which comes from the same usage request; no additional request is sent.
+only. The Fable quota on the usage ring and in the Claude tray tooltip comes
+from the same usage request; no additional request is sent.
 
 - Percentages represent the account quota **used**, not remaining, token totals
   or dollar spend.
