@@ -421,7 +421,7 @@ impl Default for SettingsFile {
 }
 
 fn default_poll_interval() -> u32 {
-    POLL_15_MIN
+    POLL_1_MIN
 }
 
 fn default_widget_visible() -> bool {
@@ -2102,7 +2102,7 @@ pub fn run() {
             state
                 .as_ref()
                 .map(|s| s.poll_interval_ms)
-                .unwrap_or(POLL_15_MIN)
+                .unwrap_or(POLL_1_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
@@ -4942,7 +4942,7 @@ unsafe extern "system" fn wnd_proc(
                         IDM_FREQ_5MIN => POLL_5_MIN,
                         IDM_FREQ_15MIN => POLL_15_MIN,
                         IDM_FREQ_1HOUR => POLL_1_HOUR,
-                        _ => POLL_15_MIN,
+                        _ => POLL_1_MIN,
                     };
                     {
                         let mut state = lock_state();
@@ -5010,7 +5010,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                 ),
                 None => (
-                    POLL_15_MIN,
+                    POLL_1_MIN,
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
