@@ -9,6 +9,7 @@ mod models;
 mod native_interop;
 mod poller;
 mod readout;
+mod start_menu;
 mod theme;
 mod tray_icon;
 mod updater;
