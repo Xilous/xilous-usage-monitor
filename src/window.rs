@@ -28,6 +28,7 @@ use crate::native_interop::{
 };
 use crate::poller;
 use crate::readout;
+use crate::start_menu;
 use crate::theme;
 use crate::tray_icon;
 use crate::updater::{self, InstallChannel, ReleaseDescriptor, UpdateCheckResult};
@@ -107,6 +108,7 @@ struct AppState {
     widget_visible: bool,
     embed_in_taskbar: bool,
     click_through: bool,
+    start_menu_shortcut_made: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -397,6 +399,10 @@ struct SettingsFile {
     /// or dragged, so the tray icon becomes the only way to control it.
     #[serde(default = "default_click_through")]
     click_through: bool,
+    /// True once the app has put a shortcut in the Start menu, so a shortcut
+    /// the user later deletes is not recreated. See start_menu.rs.
+    #[serde(default)]
+    start_menu_shortcut_made: bool,
 }
 
 impl Default for SettingsFile {
@@ -416,6 +422,7 @@ impl Default for SettingsFile {
             show_antigravity: false,
             embed_in_taskbar: default_embed_in_taskbar(),
             click_through: default_click_through(),
+            start_menu_shortcut_made: false,
         }
     }
 }
@@ -505,6 +512,7 @@ fn save_state_settings() {
             show_antigravity: s.show_antigravity,
             embed_in_taskbar: s.embed_in_taskbar,
             click_through: s.click_through,
+            start_menu_shortcut_made: s.start_menu_shortcut_made,
         });
     }
 }
@@ -1910,6 +1918,12 @@ pub fn run() {
         migrate_legacy_settings();
         migrate_legacy_startup();
         let mut settings = load_settings();
+        // Saved here, before --codex-only below changes settings for this run only.
+        let shortcut_made = start_menu::sync(settings.start_menu_shortcut_made);
+        if shortcut_made != settings.start_menu_shortcut_made {
+            settings.start_menu_shortcut_made = shortcut_made;
+            save_settings(&settings);
+        }
         if std::env::args().any(|arg| arg == "--codex-only") {
             settings.show_claude_code = false;
             settings.show_codex = true;
@@ -2018,6 +2032,7 @@ pub fn run() {
                 widget_visible: settings.widget_visible,
                 embed_in_taskbar: settings.embed_in_taskbar,
                 click_through: settings.click_through,
+                start_menu_shortcut_made: settings.start_menu_shortcut_made,
             });
         }
 

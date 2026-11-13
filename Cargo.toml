@@ -1,6 +1,6 @@
 [package]
 name = "xilous-usage-monitor"
-version = "2.17.1"
+version = "2.18.0"
 edition = "2021"
 license = "MIT"
 description = "Xilous Usage Monitor"
@@ -37,6 +37,10 @@ version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    # Start menu shortcut (src/start_menu.rs): COM, IShellLinkW, IPersistFile.
+    # IShellLinkW::GetPath needs FileSystem for its WIN32_FIND_DATAW argument.
+    "Win32_System_Com",
+    "Win32_Storage_FileSystem",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
