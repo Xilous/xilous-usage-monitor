@@ -5,16 +5,13 @@
 //! catch distance it snaps on and slides along that edge. Let go, it carries
 //! the throw's momentum onto the nearest outer edge. On the left or right edge
 //! the two ring pairs stack; on the top or bottom they sit side by side.
-//! Hovered, it expands into the full widget, growing away from its edge.
+//! Hovered, it expands into a card of pace bars, growing away from its edge.
 //!
 //! This module is the geometry, the springs and the layouts only. It knows
 //! nothing of Win32, so it is unit tested on its own: window.rs feeds it the
 //! monitors, the cursor and the clock, and draws whatever frame it returns.
 
-use crate::window::{
-    FIGURE_W, LABEL_W, LEFT_DIVIDER_W, RESET_W, RING_D, RING_Y, SPLIT_H, SPLIT_X, SPLIT_Y,
-    SYSTEM_X, TEXT_DX, USAGE_FIGURE_W, USAGE_LABEL_W, USAGE_X, WIDGET_HEIGHT, WIDGET_W,
-};
+use crate::window::{RING_D, RING_Y, USAGE_X};
 
 /// Magnet and throw tuning, in base pixels (96 DPI) and seconds.
 const MAGNET_RANGE: f64 = 160.0;
@@ -36,9 +33,6 @@ const LIFT_GROWTH: f64 = 0.06;
 /// Only the last stretch of a drag counts toward the throw.
 const THROW_WINDOW: f64 = 0.09;
 const THROW_STALE: f64 = 0.06;
-
-/// Length of the drag handle's hairlines.
-const HANDLE_LEN: f64 = 25.0;
 
 // ---- Geometry ---------------------------------------------------------------
 
@@ -330,141 +324,104 @@ impl Spring {
 // ---- Layouts ----------------------------------------------------------------
 
 /// Where everything sits inside the widget, in base pixels.
+///
+/// Collapsed, the widget is a pill holding two ring clusters, usage and
+/// device, side by side or stacked. Expanded, it is a card of rows, one
+/// straight pace bar per ring, and each ring unrolls into its bar on the way.
+/// `w` and `h` are the window, part way between the pill and the card.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     pub w: f64,
     pub h: f64,
-    /// Top-left of the usage and device rings.
+    /// The collapsed pill's size in this orientation.
+    pub pill: [f64; 2],
+    /// Top-left of the usage and device rings inside the pill.
     pub usage: [f64; 2],
     pub device: [f64; 2],
-    /// The hairline between the two ring pairs, and the drag handle: x, y, w, h.
-    pub split: [f64; 4],
-    pub handle: [f64; 4],
-    /// Left edge of each block's figures.
-    pub usage_text_x: f64,
-    pub device_text_x: f64,
+    /// The expanded card's size and rows.
+    pub card: Card,
+}
+
+/// The expanded card: one row per usage window, a hairline, then CPU and RAM.
+/// Every y is the centre line of a row's bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Card {
+    pub w: f64,
+    pub h: f64,
+    pub usage_rows: usize,
+    pub usage_y: [f64; 3],
+    pub split_y: f64,
+    pub device_y: [f64; 2],
+}
+
+pub const CARD_W: f64 = 316.0;
+/// Columns of a card row, from its left edge: the label, the bar, the
+/// percentage (right-aligned at FIGURE_R) and the reset time (right-aligned
+/// at RESET_R).
+pub const LABEL_X: f64 = 14.0;
+pub const BAR_X0: f64 = 54.0;
+pub const BAR_X1: f64 = 194.0;
+pub const FIGURE_R: f64 = 240.0;
+pub const RESET_R: f64 = 302.0;
+pub const CARD_RADIUS: f64 = 8.0;
+const ROW_TOP: f64 = 23.0;
+const ROW_STEP: f64 = 24.0;
+const DEVICE_STEP: f64 = 22.0;
+const SPLIT_GAP: f64 = 17.0;
+
+/// The card for `usage_rows` usage windows (one to three).
+pub fn card(usage_rows: usize) -> Card {
+    let n = usage_rows.clamp(1, 3);
+    let usage_y = std::array::from_fn(|i| ROW_TOP + i.min(n - 1) as f64 * ROW_STEP);
+    let last = ROW_TOP + (n - 1) as f64 * ROW_STEP;
+    let split_y = last + SPLIT_GAP;
+    let device_y = [split_y + SPLIT_GAP, split_y + SPLIT_GAP + DEVICE_STEP];
+    Card {
+        w: CARD_W,
+        h: device_y[1] + 18.0,
+        usage_rows: n,
+        usage_y,
+        split_y,
+        device_y,
+    }
 }
 
 fn mix(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
-fn mix_n<const N: usize>(a: [f64; N], b: [f64; N], t: f64) -> [f64; N] {
-    std::array::from_fn(|i| mix(a[i], b[i], t))
+/// The pill: the two ring clusters side by side (`stacked_t` 0) or one above
+/// the other (1), with the same margin all round.
+fn pill(stacked_t: f64) -> ([f64; 2], [f64; 2], [f64; 2]) {
+    let d = RING_D as f64;
+    let inset = RING_Y as f64;
+    let along = USAGE_X as f64;
+    let gap = along - inset + 2.0 * PILL_GAP;
+    let long = along + d + gap + d + along;
+    let short = inset + d + inset;
+    let size = [mix(long, short, stacked_t), mix(short, long, stacked_t)];
+    let usage = [mix(along, inset, stacked_t), mix(inset, along, stacked_t)];
+    let second = along + d + gap;
+    let device = [mix(second, inset, stacked_t), mix(inset, second, stacked_t)];
+    (size, usage, device)
 }
 
-impl Layout {
-    fn mix(&self, o: &Layout, t: f64) -> Layout {
-        Layout {
-            w: mix(self.w, o.w, t),
-            h: mix(self.h, o.h, t),
-            usage: mix_n(self.usage, o.usage, t),
-            device: mix_n(self.device, o.device, t),
-            split: mix_n(self.split, o.split, t),
-            handle: mix_n(self.handle, o.handle, t),
-            usage_text_x: mix(self.usage_text_x, o.usage_text_x, t),
-            device_text_x: mix(self.device_text_x, o.device_text_x, t),
-        }
-    }
-}
+/// Half the space between the two ring clusters, beyond their margins.
+const PILL_GAP: f64 = 3.0;
 
-/// The spacing between a ring and the hairline beside it.
-fn pad() -> f64 {
-    (SYSTEM_X - SPLIT_X) as f64
-}
-
-fn usage_text_w() -> f64 {
-    (USAGE_LABEL_W + USAGE_FIGURE_W + RESET_W) as f64
-}
-
-fn device_text_w() -> f64 {
-    (LABEL_W + FIGURE_W) as f64
-}
-
-/// Space after the last figure, at the far end of the expanded widget.
-fn end_pad() -> f64 {
-    (WIDGET_W - (SYSTEM_X + TEXT_DX + LABEL_W + FIGURE_W)) as f64
-}
-
-/// The two ring pairs side by side: expanded is the shipped widget; collapsed
-/// drops the figure columns and closes the gap.
-fn side_by_side(expanded: bool) -> Layout {
-    let ring_y = RING_Y as f64;
-    let usage_x = USAGE_X as f64;
-    let short = WIDGET_HEIGHT as f64;
-    let (split_x, device_x, w) = if expanded {
-        (SPLIT_X as f64, SYSTEM_X as f64, WIDGET_W as f64)
-    } else {
-        let split_x = usage_x + RING_D as f64 + pad();
-        let device_x = split_x + pad();
-        (split_x, device_x, device_x + RING_D as f64 + end_pad())
-    };
+/// The layout `stacked_t` of the way from side by side to stacked and
+/// `expanded` of the way from the pill to the card of `usage_rows` rows.
+pub fn layout(stacked_t: f64, expanded: f64, usage_rows: usize) -> Layout {
+    let (size, usage, device) = pill(stacked_t.clamp(0.0, 1.0));
+    let card = card(usage_rows);
     Layout {
-        w,
-        h: short,
-        usage: [usage_x, ring_y],
-        device: [device_x, ring_y],
-        split: [split_x, SPLIT_Y as f64, 1.0, SPLIT_H as f64],
-        handle: [
-            0.0,
-            (short - HANDLE_LEN) / 2.0,
-            LEFT_DIVIDER_W as f64,
-            HANDLE_LEN,
-        ],
-        usage_text_x: usage_x + TEXT_DX as f64,
-        device_text_x: device_x + TEXT_DX as f64,
+        w: mix(size[0], card.w, expanded),
+        h: mix(size[1], card.h, expanded),
+        pill: size,
+        usage,
+        device,
+        card,
     }
-}
-
-/// The two ring pairs stacked, usage on top. Collapsed is the side-by-side
-/// collapsed widget turned on its side. Expanded puts each block's figures
-/// beside its ring, on the left when `mirror` (the right edge) so the rings
-/// themselves stay put as it expands.
-fn stacked(expanded: bool, mirror: bool) -> Layout {
-    let flat = side_by_side(false);
-    let ring_inset = RING_Y as f64;
-    let w = if expanded {
-        ring_inset + RING_D as f64 + pad() + usage_text_w() + end_pad()
-    } else {
-        flat.h
-    };
-    let ring_x = if mirror {
-        w - ring_inset - RING_D as f64
-    } else {
-        ring_inset
-    };
-    let (usage_text_x, device_text_x) = if mirror {
-        (
-            ring_x - pad() - usage_text_w(),
-            ring_x - pad() - device_text_w(),
-        )
-    } else {
-        (ring_x + TEXT_DX as f64, ring_x + TEXT_DX as f64)
-    };
-    let split_inset = SPLIT_Y as f64;
-    Layout {
-        w,
-        h: flat.w,
-        usage: [ring_x, flat.usage[0]],
-        device: [ring_x, flat.device[0]],
-        split: [split_inset, flat.split[0], w - 2.0 * split_inset, 1.0],
-        handle: [
-            (w - HANDLE_LEN) / 2.0,
-            0.0,
-            HANDLE_LEN,
-            LEFT_DIVIDER_W as f64,
-        ],
-        usage_text_x,
-        device_text_x,
-    }
-}
-
-/// The layout `stacked` of the way from side by side to stacked and
-/// `expanded` of the way from collapsed to the full widget.
-pub fn layout(stacked_t: f64, expanded: f64, mirror: bool) -> Layout {
-    let flat = side_by_side(false).mix(&side_by_side(true), expanded);
-    let upright = stacked(false, mirror).mix(&stacked(true, mirror), expanded);
-    flat.mix(&upright, stacked_t)
 }
 
 // ---- Motion -----------------------------------------------------------------
@@ -494,8 +451,7 @@ pub struct Frame {
     /// Screen pixels per base pixel, lift included.
     pub scale: f64,
     pub layout: Layout,
-    /// How far each morph has gone, and how much of the background shows.
-    pub stacked: f64,
+    /// How far the expansion has gone, and how much of the background shows.
     pub expanded: f64,
     pub hover: f64,
     pub side: Side,
@@ -522,6 +478,8 @@ pub struct Motion {
     press: Option<Press>,
     hovered: bool,
     left_at: f64,
+    /// Usage windows on show, which sets the expanded card's height.
+    rows: usize,
 }
 
 impl Motion {
@@ -540,7 +498,13 @@ impl Motion {
             press: None,
             hovered: false,
             left_at: f64::NEG_INFINITY,
+            rows: 3,
         }
+    }
+
+    /// How many usage windows the widget shows, one to three.
+    pub fn set_rows(&mut self, rows: usize) {
+        self.rows = rows.clamp(1, 3);
     }
 
     /// The point to save: where the widget docks, or is headed.
@@ -563,7 +527,7 @@ impl Motion {
     }
 
     fn collapsed_size(&self, scale: f64) -> [f64; 2] {
-        let l = layout(self.stacked.x.clamp(0.0, 1.0), 0.0, false);
+        let l = layout(self.stacked.x.clamp(0.0, 1.0), 0.0, self.rows);
         [l.w * scale, l.h * scale]
     }
 
@@ -654,7 +618,7 @@ impl Motion {
         }
         let dt = dt.clamp(0.0, 0.064);
         let collapsed = |stacked_edge: bool| {
-            let l = layout(if stacked_edge { 1.0 } else { 0.0 }, 0.0, false);
+            let l = layout(if stacked_edge { 1.0 } else { 0.0 }, 0.0, 1);
             [l.w * scale, l.h * scale]
         };
         let current_size = self.collapsed_size(scale);
@@ -751,8 +715,8 @@ impl Motion {
         let a = self.hover.x.clamp(0.0, 1.0);
         let mirror = docked && self.side == Side::Right;
         let lifted = scale * (1.0 + LIFT_GROWTH * self.lift.x);
-        let rest = layout(t, 0.0, mirror);
-        let l = layout(t, e, mirror);
+        let rest = layout(t, 0.0, self.rows);
+        let l = layout(t, e, self.rows);
         let (cw, ch) = (rest.w * lifted, rest.h * lifted);
         let (w, h) = (l.w * lifted, l.h * lifted);
 
@@ -796,7 +760,6 @@ impl Motion {
             height: h,
             scale: lifted,
             layout: l,
-            stacked: t,
             expanded: e,
             hover: a,
             side: self.side,
@@ -842,28 +805,30 @@ mod tests {
     }
 
     fn size(stacked: bool) -> [f64; 2] {
-        let l = layout(if stacked { 1.0 } else { 0.0 }, 0.0, false);
+        let l = layout(if stacked { 1.0 } else { 0.0 }, 0.0, 2);
         [l.w, l.h]
     }
 
     #[test]
-    fn layouts_match_the_shipped_widget_and_its_collapsed_forms() {
-        let full = layout(0.0, 1.0, false);
-        assert_eq!((full.w, full.h), (350.0, 62.0));
-        assert_eq!(full.device, [226.0, 6.0]);
-        assert!(full.usage_text_x + usage_text_w() < full.split[0]);
-        let flat = layout(0.0, 0.0, false);
+    fn the_pill_keeps_its_size_and_the_card_fits_its_rows() {
+        let flat = layout(0.0, 0.0, 2);
         assert_eq!((flat.w, flat.h), (136.0, 62.0));
-        assert_eq!(flat.device, [78.0, 6.0]);
-        let upright = layout(1.0, 0.0, false);
+        assert_eq!(flat.usage, [12.0, 6.0]);
+        assert_eq!(flat.device, [74.0, 6.0]);
+        let upright = layout(1.0, 0.0, 2);
         assert_eq!((upright.w, upright.h), (62.0, 136.0));
         assert_eq!(upright.usage, [6.0, 12.0]);
-        assert_eq!(upright.device, [6.0, 78.0]);
-        let tall = layout(1.0, 1.0, true);
-        assert_eq!((tall.w, tall.h), (216.0, 136.0));
-        // On the right edge the rings keep their distance from the edge.
-        assert_eq!(tall.w - tall.usage[0], upright.w - upright.usage[0]);
-        assert!(tall.usage_text_x + usage_text_w() <= tall.usage[0]);
+        assert_eq!(upright.device, [6.0, 74.0]);
+        // Two usage windows (no 5h limit) make a shorter card than three.
+        let two = layout(0.0, 1.0, 2);
+        let three = layout(0.0, 1.0, 3);
+        assert_eq!(two.w, CARD_W);
+        assert!(two.h < three.h);
+        assert_eq!(two.card.usage_rows, 2);
+        assert!(two.card.device_y[1] + 9.0 < two.h);
+        assert!(two.card.split_y > two.card.usage_y[1]);
+        // A card and its pill agree whichever way up the pill is.
+        assert_eq!(layout(1.0, 1.0, 3).h, three.h);
     }
 
     #[test]
@@ -1005,7 +970,7 @@ mod tests {
         }
         let f = f.unwrap();
         assert!(f.mirror && f.expanded > 0.99);
-        assert!((f.width - 216.0).abs() < 0.5);
+        assert!((f.width - CARD_W).abs() < 0.5);
         assert!((f.left + f.width - 1920.0).abs() < 0.5);
     }
 }

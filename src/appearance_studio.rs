@@ -1,10 +1,10 @@
 //! Native, keyboard-accessible appearance controls with an immediate color preview.
 use crate::{
     appearance::{
-        color, snap_widget_size, Appearance, Mode, PRESETS, WIDGET_SIZE_MAX, WIDGET_SIZE_MIN,
-        WIDGET_SIZE_STEP,
+        color, mix, preset, snap_widget_size, Appearance, Material, WarningColours, WindowColours,
+        PRESETS, ROLE_NAMES, SYSTEM, WIDGET_SIZE_MAX, WIDGET_SIZE_MIN, WIDGET_SIZE_STEP,
     },
-    native_interop::{wide_str, Color},
+    native_interop::wide_str,
     theme, window,
 };
 use std::sync::{
@@ -28,9 +28,50 @@ static SLIDER_BRUSH: AtomicIsize = AtomicIsize::new(0);
 const SLIDER_ID: u16 = 140;
 /// Not exported by the windows crate; TBM_GETPOS is WM_USER.
 const TBM_GETPOS: u32 = WM_USER;
-const MODES: [&str; 4] = ["System", "Light", "Dark", "Custom"];
-const FIELDS: [&str; 5] = ["Background", "Text", "Claude", "Codex", "Antigravity"];
-const MODE_VALUES: [Mode; 4] = [Mode::System, Mode::Light, Mode::Dark, Mode::Custom];
+/// Control ids: the themes (System, then each preset), the colour roles, and
+/// the three look options.
+const THEME_ID: u16 = 200;
+const ROLE_ID: u16 = 300;
+const WINDOWS_ID: u16 = 400;
+const WARNINGS_ID: u16 = 410;
+const MATERIAL_ID: u16 = 420;
+const THEME_COUNT: u16 = 1 + PRESETS.len() as u16;
+const WINDOW_OPTIONS: [(WindowColours, &str); 3] = [
+    (WindowColours::Own, "Own colour each"),
+    (WindowColours::Shaded, "One colour, shaded"),
+    (WindowColours::Mono, "Monochrome"),
+];
+const WARNING_OPTIONS: [(WarningColours, &str); 3] = [
+    (WarningColours::Theme, "Theme"),
+    (WarningColours::ColourBlind, "Colour-blind safe"),
+    (WarningColours::Hatching, "Hatching only"),
+];
+const MATERIAL_OPTIONS: [(Material, &str); 2] = [
+    (Material::Solid, "Solid"),
+    (Material::Floating, "Floating rings"),
+];
+const WIDTH: i32 = 520;
+const HEIGHT: i32 = 748;
+/// The rows of the look options, and where their buttons start.
+const LOOK_Y: [i32; 3] = [506, 542, 578];
+const LOOK_X: i32 = 160;
+
+/// The theme id of theme button `i`: System, then the presets in order.
+fn theme_id(i: u16) -> &'static str {
+    if i == 0 {
+        SYSTEM
+    } else {
+        PRESETS[(i - 1) as usize].id
+    }
+}
+
+fn theme_name(i: u16) -> &'static str {
+    if i == 0 {
+        "System"
+    } else {
+        PRESETS[(i - 1) as usize].name
+    }
+}
 
 fn rect(x: i32, y: i32, w: i32, h: i32) -> RECT {
     RECT {
@@ -80,7 +121,7 @@ pub fn open(owner: HWND) {
         let _ = RegisterClassW(&wc);
         let title = wide_str("Appearance Studio");
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
-        let mut bounds = rect(0, 0, 488, 680);
+        let mut bounds = rect(0, 0, WIDTH, HEIGHT);
         let _ = AdjustWindowRectEx(&mut bounds, style, false, WS_EX_TOOLWINDOW);
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
@@ -110,34 +151,45 @@ pub fn open(owner: HWND) {
             Err(_) => return,
         };
         STUDIO.store(hwnd.0 as isize, Ordering::Relaxed);
-        for (i, text) in MODES.iter().enumerate() {
+        for i in 0..THEME_COUNT {
+            let (col, row) = (i as i32 % 4, i as i32 / 4);
             button(
                 hwnd,
-                100 + i as u16,
-                text,
-                rect(24 + i as i32 * 112, 120, 104, 64),
+                THEME_ID + i,
+                theme_name(i),
+                rect(24 + col * 120, 118 + row * 58, 112, 50),
             );
         }
-        for (i, (name, _)) in PRESETS.iter().enumerate() {
+        for (i, name) in ROLE_NAMES.iter().enumerate() {
+            let (col, row) = (i as i32 % 5, i as i32 / 5);
             button(
                 hwnd,
-                110 + i as u16,
+                ROLE_ID + i as u16,
                 name,
-                rect(24 + i as i32 * 112, 346, 104, 54),
+                rect(24 + col * 96, 324 + row * 68, 88, 60),
             );
         }
-        for (i, text) in FIELDS.iter().enumerate() {
-            button(
-                hwnd,
-                120 + i as u16,
-                text,
-                rect(24 + i as i32 * 90, 442, 80, 68),
-            );
+        let segments: [(u16, Vec<&str>); 3] = [
+            (WINDOWS_ID, WINDOW_OPTIONS.iter().map(|o| o.1).collect()),
+            (WARNINGS_ID, WARNING_OPTIONS.iter().map(|o| o.1).collect()),
+            (MATERIAL_ID, MATERIAL_OPTIONS.iter().map(|o| o.1).collect()),
+        ];
+        for (row, (base, names)) in segments.iter().enumerate() {
+            let span = WIDTH - 24 - LOOK_X;
+            let w = (span - 6 * (names.len() as i32 - 1)) / names.len() as i32;
+            for (i, name) in names.iter().enumerate() {
+                button(
+                    hwnd,
+                    base + i as u16,
+                    name,
+                    rect(LOOK_X + i as i32 * (w + 6), LOOK_Y[row], w, 30),
+                );
+            }
         }
-        slider(hwnd, rect(112, 572, 288, 32));
-        button(hwnd, 130, "Reset", rect(24, 626, 76, 32));
-        button(hwnd, 131, "Undo changes", rect(110, 626, 124, 32));
-        button(hwnd, 132, "Done", rect(356, 626, 108, 32));
+        slider(hwnd, rect(112, 646, 320, 32));
+        button(hwnd, 130, "Reset", rect(24, 700, 76, 32));
+        button(hwnd, 131, "Undo changes", rect(110, 700, 124, 32));
+        button(hwnd, 132, "Done", rect(WIDTH - 132, 700, 108, 32));
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SendMessageW(hwnd, WM_NEXTDLGCTL, WPARAM(0), LPARAM(0));
@@ -276,7 +328,7 @@ unsafe fn preview_picked(dialog: HWND) {
         };
         p.last = bgr;
         let mut next = p.base.clone();
-        next.colors[p.index] = bgr_to_rgb(bgr);
+        next.set_role(theme::is_dark_mode(), p.index, bgr_to_rgb(bgr));
         next
     };
     window::preview_appearance(next);
@@ -293,30 +345,28 @@ unsafe fn preview_picked(dialog: HWND) {
 
 unsafe fn choose_color(hwnd: HWND, index: usize) {
     let original = window::appearance();
-    let mut appearance = original.clone();
-    if appearance.mode != Mode::Custom {
-        let palette = appearance.palette(appearance.is_dark(theme::is_dark_mode()));
-        appearance.colors = palette.map(|c| (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32);
-    }
+    let system_dark = theme::is_dark_mode();
+    let current = original.roles_for(system_dark).get(index);
+    // The custom swatches offer the presets' window colours to start from.
     let mut custom = [COLORREF(0); 16];
-    for (i, (_, colors)) in PRESETS.iter().enumerate() {
-        for j in 0..4 {
-            custom[i * 4 + j] = COLORREF(color(colors[j]).to_colorref());
-        }
+    let offered = PRESETS
+        .iter()
+        .flat_map(|p| [p.roles.weekly, p.roles.fable])
+        .take(16);
+    for (slot, rgb) in custom.iter_mut().zip(offered) {
+        *slot = COLORREF(color(rgb).to_colorref());
     }
     let mut chooser = CHOOSECOLORW {
         lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
         hwndOwner: hwnd,
-        rgbResult: COLORREF(color(appearance.colors[index]).to_colorref()),
+        rgbResult: COLORREF(color(current).to_colorref()),
         lpCustColors: custom.as_mut_ptr(),
         Flags: CC_FULLOPEN | CC_RGBINIT | CC_ENABLEHOOK,
         lpfnHook: Some(picker_hook),
         ..Default::default()
     };
-    let mut base = appearance.clone();
-    base.mode = Mode::Custom;
     *PICKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Picker {
-        base,
+        base: original.clone(),
         index,
         last: chooser.rgbResult.0,
         ready: false,
@@ -329,8 +379,8 @@ unsafe fn choose_color(hwnd: HWND, index: usize) {
         chooser.rgbResult.0
     ));
     if accepted {
-        appearance.colors[index] = bgr_to_rgb(chooser.rgbResult.0);
-        appearance.mode = Mode::Custom;
+        let mut appearance = original;
+        appearance.set_role(system_dark, index, bgr_to_rgb(chooser.rgbResult.0));
         window::set_appearance(appearance);
     } else {
         // Re-save: another path (a drag, an update check) may have written the preview meanwhile.
@@ -362,16 +412,25 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let id = (wp.0 & 0xffff) as u16;
             let mut appearance = window::appearance();
             match id {
-                100..=103 => {
-                    appearance.mode = MODE_VALUES[(id - 100) as usize];
+                id if (THEME_ID..THEME_ID + THEME_COUNT).contains(&id) => {
+                    appearance.use_theme(theme_id(id - THEME_ID));
                     window::set_appearance(appearance);
                 }
-                110..=113 => {
-                    appearance.mode = Mode::Custom;
-                    appearance.colors = PRESETS[(id - 110) as usize].1;
+                id if (ROLE_ID..ROLE_ID + ROLE_NAMES.len() as u16).contains(&id) => {
+                    choose_color(hwnd, (id - ROLE_ID) as usize)
+                }
+                id if (WINDOWS_ID..WINDOWS_ID + 3).contains(&id) => {
+                    appearance.window_colours = WINDOW_OPTIONS[(id - WINDOWS_ID) as usize].0;
                     window::set_appearance(appearance);
                 }
-                120..=124 => choose_color(hwnd, (id - 120) as usize),
+                id if (WARNINGS_ID..WARNINGS_ID + 3).contains(&id) => {
+                    appearance.warning_colours = WARNING_OPTIONS[(id - WARNINGS_ID) as usize].0;
+                    window::set_appearance(appearance);
+                }
+                id if (MATERIAL_ID..MATERIAL_ID + 2).contains(&id) => {
+                    appearance.material = MATERIAL_OPTIONS[(id - MATERIAL_ID) as usize].0;
+                    window::set_appearance(appearance);
+                }
                 130 => window::set_appearance(Appearance::default()),
                 131 => {
                     let original = ORIGINAL.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -404,7 +463,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 if appearance.widget_size != widget_size {
                     appearance.widget_size = widget_size;
                     window::set_appearance(appearance);
-                    let readout = rect(408, 572, 56, 32);
+                    let readout = rect(440, 646, 56, 32);
                     let _ = InvalidateRect(hwnd, Some(&readout as *const _), false);
                 }
             }
@@ -440,7 +499,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 fn paint(dc: HDC) {
-    draw_rounded_rect(dc, &rect(0, 0, 488, 680), &color(0x11151e), 0);
+    draw_rounded_rect(dc, &rect(0, 0, WIDTH, HEIGHT), &color(0x11151e), 0);
     label(
         dc,
         rect(24, 20, 440, 36),
@@ -452,98 +511,41 @@ fn paint(dc: HDC) {
     label(
         dc,
         rect(24, 61, 440, 20),
-        "Your usage. Your colors. No restart.",
+        "Your usage. Your colours. No restart.",
         0x9ca8bc,
         12,
         FW_NORMAL,
     );
+    let heading =
+        |y: i32, text: &str| label(dc, rect(24, y, 440, 18), text, 0x9ca8bc, 10, FW_SEMIBOLD);
+    heading(94, "01  /  CHOOSE A THEME");
+    heading(300, "02  /  MAKE IT YOURS");
     label(
         dc,
-        rect(24, 94, 320, 18),
-        "01  /  CHOOSE YOUR MODE",
-        0x9ca8bc,
-        10,
-        FW_SEMIBOLD,
-    );
-    let appearance = window::appearance();
-    let p = appearance.palette(appearance.is_dark(theme::is_dark_mode()));
-    draw_rounded_rect(dc, &rect(24, 204, 440, 102), &p[0], sc(10));
-    label(
-        dc,
-        rect(40, 214, 400, 16),
-        "COLOR PREVIEW  /  sample usage",
-        rgb(p[1]),
-        9,
-        FW_MEDIUM,
-    );
-    for (i, (name, usage, reset)) in [
-        ("CLAUDE", "32%", "resets in 3h 12m"),
-        ("CODEX", "58%", "resets in 4d 8h"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let x = 40 + i as i32 * 214;
-        label(
-            dc,
-            rect(x, 239, 180, 14),
-            name,
-            rgb(p[i + 2]),
-            10,
-            FW_SEMIBOLD,
-        );
-        label(dc, rect(x, 258, 64, 28), usage, rgb(p[1]), 24, FW_SEMIBOLD);
-        label(
-            dc,
-            rect(x + 66, 263, 130, 20),
-            reset,
-            rgb(p[1]),
-            10,
-            FW_NORMAL,
-        );
-        draw_rounded_rect(dc, &rect(x, 292, 192, 2), &color(0x515966), sc(1));
-        draw_rounded_rect(
-            dc,
-            &rect(x, 292, if i == 0 { 61 } else { 111 }, 2),
-            &p[i + 2],
-            sc(1),
-        );
-    }
-    label(
-        dc,
-        rect(24, 319, 430, 18),
-        "02  /  START WITH A PALETTE",
-        0x9ca8bc,
-        10,
-        FW_SEMIBOLD,
-    );
-    label(
-        dc,
-        rect(24, 415, 440, 18),
-        "03  /  MAKE IT YOURS",
-        0x9ca8bc,
-        10,
-        FW_SEMIBOLD,
-    );
-    label(
-        dc,
-        rect(24, 516, 440, 18),
-        "Click a color to mix your own. Warning colors stay meaningful.",
+        rect(24, 458, 472, 18),
+        "Click a colour to mix your own. Dimmed colours are not in use with the options below.",
         0x8e9bae,
         10,
         FW_NORMAL,
     );
+    heading(482, "03  /  HOW IT READS");
+    for (y, name) in LOOK_Y
+        .iter()
+        .zip(["Window colours", "Warning colours", "Background"])
+    {
+        label(
+            dc,
+            rect(24, *y, LOOK_X - 30, 30),
+            name,
+            0xe8edf6,
+            11,
+            FW_MEDIUM,
+        );
+    }
+    heading(622, "04  /  WIDGET SIZE");
     label(
         dc,
-        rect(24, 548, 440, 18),
-        "04  /  WIDGET SIZE",
-        0x9ca8bc,
-        10,
-        FW_SEMIBOLD,
-    );
-    label(
-        dc,
-        rect(24, 572, 86, 32),
+        rect(24, 646, 86, 32),
         "Widget size",
         0xe8edf6,
         12,
@@ -551,15 +553,15 @@ fn paint(dc: HDC) {
     );
     label(
         dc,
-        rect(408, 572, 56, 32),
-        &format!("{}%", appearance.clamped_widget_size()),
+        rect(440, 646, 56, 32),
+        &format!("{}%", window::appearance().clamped_widget_size()),
         0xf2f4fa,
         12,
         FW_SEMIBOLD,
     );
     label(
         dc,
-        rect(246, 633, 100, 18),
+        rect(246, 707, 120, 18),
         "Saved as you go",
         0x9ca8bc,
         10,
@@ -567,22 +569,44 @@ fn paint(dc: HDC) {
     );
 }
 
-fn rgb(c: Color) -> u32 {
-    (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32
+/// Whether colour role `i` shows on the widget with these options.
+fn role_in_use(a: &Appearance, i: usize) -> bool {
+    match i {
+        2..=6 if a.window_colours == WindowColours::Mono => false,
+        2 | 4 if a.window_colours == WindowColours::Shaded => false,
+        7 | 8 => a.warning_colours == WarningColours::Theme,
+        _ => true,
+    }
 }
 
 unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
     let a = window::appearance();
-    let dark = a.is_dark(theme::is_dark_mode());
-    let palette = a.palette(dark);
+    let roles = a.roles_for(theme::is_dark_mode());
     let id = item.CtlID as u16;
     let r = item.rcItem;
     let dc = item.hDC;
     draw_rounded_rect(dc, &r, &color(0x11151e), 0);
-    let selected = match id {
-        100..=103 => a.mode == MODE_VALUES[(id - 100) as usize],
-        110..=113 => a.mode == Mode::Custom && a.colors == PRESETS[(id - 110) as usize].1,
-        _ => false,
+    let is_theme = (THEME_ID..THEME_ID + THEME_COUNT).contains(&id);
+    let is_role = (ROLE_ID..ROLE_ID + ROLE_NAMES.len() as u16).contains(&id);
+    let option_name = match id {
+        id if (WINDOWS_ID..WINDOWS_ID + 3).contains(&id) => {
+            let (v, name) = WINDOW_OPTIONS[(id - WINDOWS_ID) as usize];
+            Some((a.window_colours == v, name))
+        }
+        id if (WARNINGS_ID..WARNINGS_ID + 3).contains(&id) => {
+            let (v, name) = WARNING_OPTIONS[(id - WARNINGS_ID) as usize];
+            Some((a.warning_colours == v, name))
+        }
+        id if (MATERIAL_ID..MATERIAL_ID + 2).contains(&id) => {
+            let (v, name) = MATERIAL_OPTIONS[(id - MATERIAL_ID) as usize];
+            Some((a.material == v, name))
+        }
+        _ => None,
+    };
+    let selected = if is_theme {
+        a.theme == theme_id(id - THEME_ID)
+    } else {
+        option_name.is_some_and(|(on, _)| on)
     };
     let focus = item.itemState.0 & ODS_FOCUS.0 != 0;
     let pressed = item.itemState.0 & ODS_SELECTED.0 != 0;
@@ -614,72 +638,77 @@ unsafe fn draw_button(item: &DRAWITEMSTRUCT) {
         right: r.left + sc(x + w),
         bottom: r.top + sc(y + h),
     };
-    match id {
-        100..=103 => {
-            let i = (id - 100) as usize;
-            let chip = match i {
-                0 => [0xb9c4dd, 0xf3f3f3, 0x343b4d],
-                1 => [0xf3f3f3, 0xb8c5df, 0xe3c4ad],
-                2 => [0x161c28, 0x778aad, 0x434f66],
-                _ => [rgb(palette[2]), rgb(palette[3]), rgb(palette[4])],
-            };
-            for (j, c) in chip.iter().enumerate() {
-                draw_rounded_rect(
-                    dc,
-                    &local(12 + j as i32 * 18, 12, 13, 10),
-                    &color(*c),
-                    sc(3),
-                );
-            }
-            label(
-                dc,
-                local(12, 34, 82, 20),
-                MODES[i],
-                0xe8edf6,
-                12,
-                FW_SEMIBOLD,
-            );
-            if selected {
-                label(dc, local(80, 9, 16, 16), "✓", 0xa6b9ff, 12, FW_BOLD);
-            }
+    if is_theme {
+        let i = id - THEME_ID;
+        let chips = if i == 0 {
+            let (d, l) = (PRESETS[0].roles, PRESETS[1].roles);
+            [d.background, d.weekly, l.background, l.weekly]
+        } else {
+            let p = preset(theme_id(i)).map(|p| p.roles).unwrap_or(roles);
+            [p.background, p.weekly, p.fable, p.cpu]
+        };
+        for (j, c) in chips.iter().enumerate() {
+            draw_rounded_rect(dc, &local(10 + j as i32 * 18, 9, 14, 10), &color(*c), sc(3));
         }
-        110..=113 => {
-            let (name, colors) = PRESETS[(id - 110) as usize];
-            for j in 0..3 {
-                draw_rounded_rect(
-                    dc,
-                    &local(12 + j * 22, 10, 18, 10),
-                    &color(colors[(j + 2) as usize]),
-                    sc(3),
-                );
-            }
-            label(dc, local(12, 28, 88, 18), name, 0xe8edf6, 11, FW_MEDIUM);
+        label(
+            dc,
+            local(10, 25, 96, 18),
+            theme_name(i),
+            0xe8edf6,
+            11,
+            FW_MEDIUM,
+        );
+        if selected {
+            label(dc, local(90, 6, 16, 16), "\u{2713}", 0xa6b9ff, 12, FW_BOLD);
         }
-        120..=124 => {
-            let i = (id - 120) as usize;
-            draw_rounded_rect(dc, &local(10, 9, 60, 15), &palette[i], sc(3));
-            label(dc, local(8, 29, 68, 16), FIELDS[i], 0xe8edf6, 10, FW_MEDIUM);
-            label(
-                dc,
-                local(8, 46, 68, 14),
-                &format!("#{:06X}", rgb(palette[i])),
-                0x9ca8bc,
-                9,
-                FW_NORMAL,
-            );
-        }
-        _ => label(
+    } else if is_role {
+        let i = (id - ROLE_ID) as usize;
+        let used = role_in_use(&a, i);
+        let rgb = roles.get(i);
+        let swatch = if used { rgb } else { mix(rgb, 0x202735, 0.6) };
+        draw_rounded_rect(dc, &local(10, 9, 68, 15), &color(swatch), sc(3));
+        label(
+            dc,
+            local(8, 29, 76, 16),
+            ROLE_NAMES[i],
+            if used { 0xe8edf6 } else { 0x6b7486 },
+            10,
+            FW_MEDIUM,
+        );
+        label(
+            dc,
+            local(8, 44, 76, 14),
+            &format!("#{:06X}", rgb),
+            if used { 0x9ca8bc } else { 0x5b6375 },
+            9,
+            FW_NORMAL,
+        );
+    } else if let Some((_, name)) = option_name {
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let font = create_font(sc(-11), if selected { FW_SEMIBOLD } else { FW_MEDIUM });
+        let old = SelectObject(dc, font);
+        draw_text_in(
+            dc,
+            inner,
+            name,
+            &color(if selected { 0xc0ceff } else { 0xe8edf6 }),
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+        let _ = DeleteObject(font);
+    } else {
+        label(
             dc,
             local(12, 0, 120, 32),
             match id {
                 130 => "Reset",
                 131 => "Undo changes",
-                _ => "Done  →",
+                _ => "Done  \u{2192}",
             },
             if id == 132 { 0xc0ceff } else { 0xe8edf6 },
             12,
             FW_SEMIBOLD,
-        ),
+        );
     }
     if focus {
         let focus_rect = RECT {
