@@ -17,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::appearance::{Appearance, Mode, WIDGET_SIZE_DEFAULT};
+use crate::appearance::{Appearance, Material, WIDGET_SIZE_DEFAULT};
 use crate::diagnose;
 use crate::dock;
 use crate::localization::{self, Strings};
@@ -2393,51 +2393,6 @@ static MOTION_ARMED: AtomicBool = AtomicBool::new(false);
 /// The motion timer's period: the shortest a window timer allows.
 const MOTION_FRAME_MS: u32 = 10;
 
-/// Corner radius of the background that shows on hover, in base pixels.
-const PANEL_RADIUS: f64 = 6.0;
-
-/// The disc behind each collapsed ring: its opacity, and how far it reaches
-/// past the outer band in base pixels.
-const DISC_ALPHA: f64 = 0.78;
-const DISC_MARGIN: f64 = 3.0;
-
-/// Paint a disc of `fill` at `alpha` under whatever `pixels` already holds,
-/// with a faint rim of `rim` so its edge reads over a dark wallpaper too.
-#[allow(clippy::too_many_arguments)]
-fn paint_disc(
-    pixels: &mut [Premul],
-    width: i32,
-    height: i32,
-    centre: (f64, f64),
-    radius: f64,
-    fill: Color,
-    rim: Color,
-    alpha: f64,
-) {
-    let (cx, cy) = centre;
-    let y0 = ((cy - radius - 1.0).floor() as i32).max(0);
-    let y1 = ((cy + radius + 1.0).ceil() as i32).min(height);
-    let x0 = ((cx - radius - 1.0).floor() as i32).max(0);
-    let x1 = ((cx + radius + 1.0).ceil() as i32).min(width);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let dist = (x as f64 + 0.5 - cx).hypot(y as f64 + 0.5 - cy);
-            let cov = coverage(radius - dist);
-            if cov <= 0.0 {
-                continue;
-            }
-            let mut p = Premul::default();
-            p.paint(fill, alpha * cov);
-            p.paint(
-                rim,
-                alpha * 0.14 * cov * coverage(1.0 - (radius - 0.5 - dist).abs()),
-            );
-            let i = (y * width + x) as usize;
-            pixels[i] = p.over(pixels[i]);
-        }
-    }
-}
-
 fn lock_dock() -> MutexGuard<'static, Option<DockState>> {
     DOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2622,6 +2577,8 @@ fn render_docked(hwnd: HWND) {
         if !d.motion.pressed() {
             d.motion.set_hovered(over, now);
         }
+        d.motion
+            .set_rows(usage_slots([&session_text, &weekly_text, &fable.1]).len());
         let dt = now - d.last_tick;
         d.last_tick = now;
         let Some(frame) = d
@@ -2729,12 +2686,263 @@ fn render_docked(hwnd: HWND) {
     }
 }
 
+/// Which usage windows get a ring and a row, outer ring first, by slot: 0 the
+/// five-hour window, 1 the weekly one, 2 the Fable quota. A plan with no
+/// five-hour limit reports none, so the weekly window moves out to the outer
+/// ring; an account without the Fable quota has no Fable ring.
+fn usage_slots(texts: [&str; 3]) -> Vec<usize> {
+    let weekly_only = texts[0] == "n/a" && readout::has_reading(texts[1]);
+    let with_fable = texts[2] != "n/a";
+    [(0usize, !weekly_only), (1, true), (2, with_fable)]
+        .into_iter()
+        .filter_map(|(slot, shown)| shown.then_some(slot))
+        .collect()
+}
+
+/// Where each usage window's percentage sits in the animated figures.
+const SHOWN_SLOT: [usize; 3] = [0, 1, 6];
+
+/// The opacity of the collapsed pill on the Solid background.
+const PILL_ALPHA: f64 = 0.78;
+/// Thickness of an expanded pace bar, in base pixels.
+const BAR_STROKE: f64 = 6.0;
+
+/// A track that is a ring at `e` 0 and a straight bar at 1, unrolled like a
+/// tape measure: it starts at the ring's top heading clockwise, a straight run
+/// grows from that start toward the bar's left end, and whatever has not
+/// unrolled yet stays a tightening curl at the end of the run, so the shape
+/// never sweeps outside the card. All in base pixels.
+#[derive(Clone, Copy)]
+struct Tape {
+    ax: f64,
+    ay: f64,
+    len: f64,
+    run: f64,
+    curl_r: f64,
+}
+
+impl Tape {
+    fn new(ring: (f64, f64, f64), bar: (f64, f64, f64), e: f64) -> Self {
+        let (cx, cy, r) = ring;
+        let (bx, by, blen) = bar;
+        let tau = std::f64::consts::TAU;
+        let len = tau * r + (blen - tau * r) * e;
+        let curl_r = r * (1.0 - 0.55 * e);
+        let curl = tau * (1.0 - e) * curl_r;
+        Tape {
+            ax: cx + (bx - cx) * e,
+            ay: (cy - r) + (by - (cy - r)) * e,
+            len,
+            run: (len - curl).max(0.0),
+            curl_r,
+        }
+    }
+
+    /// The point `s` along the track and the direction it heads there.
+    fn at(&self, s: f64) -> (f64, f64, f64) {
+        if s <= self.run || self.curl_r < 1e-6 {
+            return (self.ax + s, self.ay, 0.0);
+        }
+        let a = (s - self.run) / self.curl_r;
+        (
+            self.ax + self.run + self.curl_r * a.sin(),
+            self.ay + self.curl_r * (1.0 - a.cos()),
+            a,
+        )
+    }
+
+    /// Points along `from..to`, in screen pixels at `scale`.
+    fn points(&self, from: f64, to: f64, scale: f64) -> Vec<(f64, f64)> {
+        let (from, to) = (from.clamp(0.0, self.len), to.clamp(0.0, self.len));
+        if to - from < 0.01 {
+            return Vec::new();
+        }
+        let n = (((to - from) / 1.5).ceil() as usize).max(1);
+        (0..=n)
+            .map(|i| {
+                let (x, y, _) = self.at(from + (to - from) * i as f64 / n as f64);
+                (x * scale, y * scale)
+            })
+            .collect()
+    }
+}
+
+/// Anti-aliased strokes with round caps, rasterised as the union of capsules
+/// along a polyline, into a coverage buffer that is then laid onto a layer in
+/// one colour.
+struct Coverage {
+    w: i32,
+    h: i32,
+    buf: Vec<f32>,
+    dirty: [i32; 4],
+}
+
+impl Coverage {
+    fn new(w: i32, h: i32) -> Self {
+        Self {
+            w,
+            h,
+            buf: vec![0.0; (w.max(0) * h.max(0)) as usize],
+            dirty: [w, h, 0, 0],
+        }
+    }
+
+    fn stroke(&mut self, pts: &[(f64, f64)], half: f64) {
+        if pts.is_empty() {
+            return;
+        }
+        let pts: Vec<(f64, f64)> = if pts.len() == 1 {
+            vec![pts[0], pts[0]]
+        } else {
+            pts.to_vec()
+        };
+        for seg in pts.windows(2) {
+            let ((x0, y0), (x1, y1)) = (seg[0], seg[1]);
+            let reach = half + 1.0;
+            let bx0 = ((x0.min(x1) - reach).floor() as i32).max(0);
+            let by0 = ((y0.min(y1) - reach).floor() as i32).max(0);
+            let bx1 = ((x0.max(x1) + reach).ceil() as i32).min(self.w);
+            let by1 = ((y0.max(y1) + reach).ceil() as i32).min(self.h);
+            if bx0 >= bx1 || by0 >= by1 {
+                continue;
+            }
+            self.dirty = [
+                self.dirty[0].min(bx0),
+                self.dirty[1].min(by0),
+                self.dirty[2].max(bx1),
+                self.dirty[3].max(by1),
+            ];
+            let (dx, dy) = (x1 - x0, y1 - y0);
+            let len2 = dx * dx + dy * dy;
+            for y in by0..by1 {
+                for x in bx0..bx1 {
+                    let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                    let t = if len2 > 0.0 {
+                        (((px - x0) * dx + (py - y0) * dy) / len2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let d = (px - (x0 + dx * t)).hypot(py - (y0 + dy * t));
+                    let c = coverage(half - d) as f32;
+                    let i = (y * self.w + x) as usize;
+                    if c > self.buf[i] {
+                        self.buf[i] = c;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lay the stroked shape onto `layer` in `color` at `alpha`, hatched with
+    /// diagonal stripes of `hatch` strength (0 for none) every `period` pixels,
+    /// and clear the buffer for the next shape.
+    fn lay(&mut self, layer: &mut [Premul], color: Color, alpha: f64, hatch: f64, period: f64) {
+        let [x0, y0, x1, y1] = self.dirty;
+        for y in y0.max(0)..y1.min(self.h) {
+            for x in x0.max(0)..x1.min(self.w) {
+                let i = (y * self.w + x) as usize;
+                let c = self.buf[i] as f64;
+                if c <= 0.0 {
+                    continue;
+                }
+                self.buf[i] = 0.0;
+                let mut p = Premul::default();
+                p.paint(color, alpha * c);
+                if hatch > 0.0 {
+                    let diag = (x + y) as f64 / std::f64::consts::SQRT_2;
+                    if (diag / period).fract() < 0.42 {
+                        p.paint(Color::new(0, 0, 0), alpha * c * 0.38 * hatch);
+                    }
+                }
+                layer[i] = p.over(layer[i]);
+            }
+        }
+        self.dirty = [self.w, self.h, 0, 0];
+    }
+}
+
+/// `text` as anti-aliased coverage in a tight box, for a figure that has to
+/// show where the panel behind it is see-through: ClearType needs an opaque
+/// background, so this one figure is drawn greyscale and laid on top.
+fn text_coverage(hdc: HDC, text: &str, height: i32, weight: FONT_WEIGHT) -> (Vec<f32>, i32, i32) {
+    unsafe {
+        let font = create_font_quality(height, weight, ANTIALIASED_QUALITY);
+        let dc = CreateCompatibleDC(hdc);
+        let old_font = SelectObject(dc, font);
+        let w = text_width(dc, text).max(1) + 2;
+        let h = height.abs() * 3 / 2 + 2;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let mut out = vec![0.0f32; (w * h) as usize];
+        if let Ok(bitmap) = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old_bmp = SelectObject(dc, bitmap);
+            fill_box(dc, 0, 0, w, h, &Color::new(0, 0, 0));
+            let _ = SetBkMode(dc, TRANSPARENT);
+            draw_text_in(
+                dc,
+                RECT {
+                    left: 1,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                text,
+                &Color::new(255, 255, 255),
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            let _ = GdiFlush();
+            let px = std::slice::from_raw_parts(bits as *const u32, (w * h) as usize);
+            for (o, p) in out.iter_mut().zip(px) {
+                *o = ((p >> 8) & 0xFF) as f32 / 255.0;
+            }
+            SelectObject(dc, old_bmp);
+            let _ = DeleteObject(bitmap);
+        }
+        SelectObject(dc, old_font);
+        let _ = DeleteObject(font);
+        let _ = DeleteDC(dc);
+        (out, w, h)
+    }
+}
+
+/// One usage window as the widget draws it.
+struct UsageRow<'a> {
+    label: &'a str,
+    pct: f64,
+    pace: Option<f64>,
+    reading: bool,
+    hue: Color,
+    /// The warning colour, or the hue while within 8 points of pace.
+    state: Color,
+    warned: bool,
+    figure: String,
+    reset: &'a str,
+    severity: u8,
+}
+
 /// Draw one docked frame into `hdc`, whose 32-bit pixels are `pixels`, and
 /// leave them premultiplied for UpdateLayeredWindow.
 ///
-/// The background, the hairlines and the figures are drawn with GDI onto an
-/// opaque background (ClearType needs one), then faded in with the hover; the
-/// rings are rasterised with their own alpha and laid over the top.
+/// Collapsed, the widget is a pill of rings: usage (5h, 7d, Fable, whichever
+/// the account reports) and the device (CPU, RAM), with the most pressing
+/// usage percentage in the middle of its rings when there is room. Hovered,
+/// the pill grows into a card and each ring unrolls into a straight pace bar,
+/// row by row, the notch on each bar where an even spend would have put it and
+/// anything past the notch hatched in the warning colour.
+///
+/// The panel, the hairlines and the row text are drawn with GDI onto an opaque
+/// background (ClearType needs one) and faded in with the hover; the rings and
+/// bars are rasterised with their own alpha and laid over the top.
 #[allow(clippy::too_many_arguments)]
 fn compose_docked(
     hdc: HDC,
@@ -2748,62 +2956,139 @@ fn compose_docked(
     paces: [Option<f64>; 3],
     stale: bool,
 ) {
-    let palette = appearance().palette(is_dark);
-    let bg = palette[0];
-    let ink = palette[1];
+    let appearance = appearance();
+    let slots = usage_slots(texts);
+    let p = appearance.resolve(is_dark, slots.first() == Some(&0));
+    let floating = appearance.material == Material::Floating;
     let l = &frame.layout;
+    let card = l.card;
     let s = frame.scale;
-    let px = |v: f64| (v * s).round() as i32;
-    let thin = px(1.0).max(1);
-    let a = frame.hover;
+    let (w, h) = (width as f64 / s, height as f64 / s);
+    let a = frame.hover.clamp(0.0, 1.0);
+    let e_all = frame.expanded.clamp(0.0, 1.0);
+    let smooth = |t: f64| {
+        let t = t.clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+
+    // The pill stays against the edge the widget docks on and the card grows
+    // away from it, so both are placed from that edge.
+    let right = frame.mirror;
+    let bottom = frame.docked && frame.side == dock::Side::Bottom;
+    let pill_x = if right { w - l.pill[0] } else { 0.0 };
+    let pill_y = if bottom { h - l.pill[1] } else { 0.0 };
+    // The card's rows are laid out in the window as it is now, stretched
+    // with it as it grows, so nothing is ever cut off part way.
+    let (sx, sy) = (w / card.w, h / card.h);
+    let cx = |v: f64| v * sx;
+    let cy = |v: f64| v * sy;
+    let rd = RING_D as f64;
+    let usage_c = (
+        pill_x + l.usage[0] + rd / 2.0,
+        pill_y + l.usage[1] + rd / 2.0,
+    );
+    let device_c = (
+        pill_x + l.device[0] + rd / 2.0,
+        pill_y + l.device[1] + rd / 2.0,
+    );
+    let stroke = RING_STROKE as f64;
+    let ring_r = |depth: usize| rd / 2.0 - stroke / 2.0 - depth as f64 * (stroke + RING_GAP as f64);
+
+    // Rows unroll one after another, top first.
+    let n = slots.len();
+    let rows_total = n + 2;
+    const DELAY: f64 = 0.07;
+    let row_e = |i: usize| {
+        ((e_all - 0.08 - DELAY * i as f64) / (0.92 - DELAY * (rows_total - 1) as f64))
+            .clamp(0.0, 1.0)
+    };
+    let text_alpha = |i: usize| ((row_e(i) - 0.55) / 0.45).clamp(0.0, 1.0);
 
     let strings = localization::STRINGS;
-    let readings = ring_readings(
-        live,
-        texts,
-        paces,
-        [
-            strings.session_window,
-            strings.weekly_window,
-            strings.fable_window,
-        ],
-        is_dark,
-        bg,
-        anim_breath(),
-        stale,
-    );
-
-    unsafe {
-        fill_box(hdc, 0, 0, width, height, &bg);
-        let _ = SetBkMode(hdc, TRANSPARENT);
-
-        if a > 0.003 {
-            // The drag handle: two hairlines along the grab edge, on the top
-            // when the widget is stacked.
-            let (div_left, div_right) = if is_dark {
-                (Color::new(80, 80, 80), Color::new(40, 40, 40))
+    let labels = [
+        strings.session_window,
+        strings.weekly_window,
+        strings.fable_window,
+    ];
+    let rows: Vec<UsageRow> = slots
+        .iter()
+        .map(|&slot| {
+            let pct = live.shown[SHOWN_SLOT[slot]].clamp(0.0, 100.0);
+            let reading = readout::has_reading(texts[slot]);
+            let pace = paces[slot].filter(|_| reading).map(|v| v.clamp(0.0, 100.0));
+            let burn = pace.map(|q| pct - q).unwrap_or(0.0);
+            let severity = if !reading {
+                0
+            } else if burn >= 18.0 {
+                2
+            } else if burn >= 8.0 {
+                1
             } else {
-                (Color::new(160, 160, 160), Color::new(230, 230, 230))
+                0
             };
-            let [hx, hy, hw, hh] = l.handle;
-            if frame.stacked > 0.5 {
-                fill_box(hdc, px(hx), px(hy), px(hw), px(2.0), &div_left);
-                fill_box(hdc, px(hx), px(hy + 2.0), px(hw), px(1.0), &div_right);
-            } else {
-                fill_box(hdc, px(hx), px(hy), px(2.0), px(hh), &div_left);
-                fill_box(hdc, px(hx + 2.0), px(hy), px(1.0), px(hh), &div_right);
+            let hue = if reading { p.windows[slot] } else { p.off };
+            let warned = severity > 0 && !p.hatch_only;
+            let state = match severity {
+                2 if !p.hatch_only => p.far_over,
+                1 if !p.hatch_only => p.over_pace,
+                _ => hue,
+            };
+            UsageRow {
+                label: labels[slot],
+                pct: if reading { pct } else { 0.0 },
+                pace,
+                reading,
+                hue,
+                state,
+                warned,
+                figure: readout::figure(pct, texts[slot]),
+                reset: if stale && reading {
+                    "Stale"
+                } else {
+                    readout::reset_label(texts[slot])
+                },
+                severity,
             }
+        })
+        .collect();
+    // The figure in the middle of the collapsed rings: the window in the most
+    // trouble, else the outermost. Three rings leave no room for it.
+    let headline = (n <= 2 && n > 0).then(|| {
+        let mut best = 0;
+        for (i, r) in rows.iter().enumerate() {
+            if r.severity > rows[best].severity {
+                best = i;
+            }
+        }
+        best
+    });
+    let figure_ink = |r: &UsageRow| {
+        let base = if r.warned { r.state } else { p.ink };
+        let base = blend(base, p.flash, live.flash * 0.5);
+        if stale && r.reading {
+            blend(base, p.bg, 0.45)
+        } else {
+            base
+        }
+    };
 
-            let [sx, sy, sw, sh] = l.split;
+    // ---- GDI layer: the panel colour, hairlines and row text ----------------
+    unsafe {
+        fill_box(hdc, 0, 0, width, height, &p.bg);
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        let px = |v: f64| (v * s).round() as i32;
+        let thin = px(1.0).max(1);
+        if a > 0.003 {
+            // The split between usage and device rows.
+            let split = blend(p.bg, p.track, smooth((e_all - 0.6) * 2.5));
             fill_box(
                 hdc,
-                px(sx),
-                px(sy),
-                px(sw).max(thin),
-                px(sh).max(thin),
-                &blend(bg, ink, 0.12),
+                px(cx(14.0)),
+                px(cy(card.split_y)),
+                px(cx(card.w - 28.0)),
+                thin,
+                &split,
             );
-
             // Poll freshness: a hairline along the side facing into the
             // screen that fills over the poll interval.
             let face = if frame.docked {
@@ -2811,9 +3096,9 @@ fn compose_docked(
             } else {
                 dock::Side::Bottom
             };
-            let inset = px(6.0);
-            let track = blend(bg, ink, 0.18);
-            let lit = blend(bg, ink, 0.45);
+            let inset = px(10.0);
+            let track = blend(p.bg, p.ink, 0.18 * a);
+            let lit = blend(p.bg, p.ink, 0.45 * a);
             match face {
                 dock::Side::Bottom | dock::Side::Top => {
                     let y = if face == dock::Side::Bottom {
@@ -2840,187 +3125,211 @@ fn compose_docked(
             }
         }
 
-        // The figures fade in over the back half of the expansion and drift
-        // out of their ring as they appear, each block clipped to its own side
-        // of the hairline so neither runs over the other's ring mid-morph.
-        let text_a = ((frame.expanded - 0.45) / 0.55).clamp(0.0, 1.0);
-        if text_a > 0.01 {
-            let figure_font = make_font(-12, FW_SEMIBOLD);
-            let time_font = make_font(-10, FW_MEDIUM);
-            let label_font = make_font(-9, FW_SEMIBOLD);
-            let old_font = SelectObject(hdc, figure_font);
-            let slide = (1.0 - text_a) * 10.0 * if frame.mirror { 1.0 } else { -1.0 };
-            let t = frame.stacked;
-            let mix = |a: f64, b: f64| a + (b - a) * t;
-            let (sx, sy) = (l.split[0], l.split[1]);
-            let clips = [
-                [0.0, 0.0, mix(sx - 3.0, l.w), mix(l.h, sy)],
-                [mix(sx + 1.0, 0.0), mix(0.0, sy + 1.0), l.w, l.h],
-            ];
-            let blocks = [
-                (
-                    l.usage_text_x,
-                    l.usage[1],
-                    &readings[0],
-                    clips[0],
-                    USAGE_LABEL_W,
-                    USAGE_FIGURE_W,
-                ),
-                (
-                    l.device_text_x,
-                    l.device[1],
-                    &readings[1],
-                    clips[1],
-                    LABEL_W,
-                    FIGURE_W,
-                ),
-            ];
-            for (text_x, ring_y, rows, clip, label_w, figure_w) in blocks {
-                let saved = SaveDC(hdc);
-                let _ = IntersectClipRect(hdc, px(clip[0]), px(clip[1]), px(clip[2]), px(clip[3]));
-                let tx = px(text_x + slide);
-                for (_, row) in rows.iter().flatten() {
-                    let top = px(ring_y + (row.y - RING_Y) as f64);
-                    let bottom = top + px(ROW_H as f64);
-                    SelectObject(hdc, label_font);
-                    draw_text_in(
-                        hdc,
-                        RECT {
-                            left: tx,
-                            top,
-                            right: tx + px(label_w as f64),
-                            bottom,
-                        },
-                        row.label,
-                        &blend(bg, row.label_color, text_a),
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                    );
-                    let fx = tx + px(label_w as f64);
-                    let figure_rect = RECT {
-                        left: fx,
-                        top,
-                        right: fx + px(figure_w as f64),
-                        bottom,
-                    };
-                    SelectObject(hdc, figure_font);
-                    draw_text_in(
-                        hdc,
-                        figure_rect,
-                        &row.figure,
-                        &blend(bg, row.figure_color, text_a),
-                        DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                    );
-                    if let Some((pace, color)) = &row.pace {
-                        draw_text_in(
-                            hdc,
-                            RECT {
-                                left: fx + text_width(hdc, &row.figure),
-                                ..figure_rect
-                            },
-                            pace,
-                            &blend(bg, *color, text_a),
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-                        );
-                    }
-                    if let Some((reset, color)) = row.reset {
-                        let rx = fx + px(figure_w as f64);
-                        SelectObject(hdc, time_font);
-                        draw_text_in(
-                            hdc,
-                            RECT {
-                                left: rx,
-                                top,
-                                right: rx + px(RESET_W as f64),
-                                bottom,
-                            },
-                            reset,
-                            &blend(bg, color, text_a),
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                        );
-                    }
-                }
-                let _ = RestoreDC(hdc, saved);
+        let font = |size: f64, weight: FONT_WEIGHT| create_font(-(size * s).round() as i32, weight);
+        let label_font = font(11.0, FW_SEMIBOLD);
+        let figure_font = font(13.0, FW_SEMIBOLD);
+        let reset_font = font(11.0, FW_NORMAL);
+        let old_font = SelectObject(hdc, label_font);
+        let row_rect = |left: f64, right: f64, y: f64| RECT {
+            left: px(left),
+            top: px(y - 9.0),
+            right: px(right),
+            bottom: px(y + 9.0),
+        };
+        let text_row = |i: usize,
+                        y: f64,
+                        label: &str,
+                        label_c: Color,
+                        figure: &str,
+                        fig_c: Color,
+                        reset: Option<&str>,
+                        skip_figure: bool| {
+            let ta = text_alpha(i);
+            if ta <= 0.01 {
+                return;
             }
-            SelectObject(hdc, old_font);
-            let _ = DeleteObject(figure_font);
-            let _ = DeleteObject(time_font);
-            let _ = DeleteObject(label_font);
+            let slide = (1.0 - ta) * -8.0;
+            SelectObject(hdc, label_font);
+            draw_text_in(
+                hdc,
+                row_rect(cx(dock::LABEL_X) + slide, cx(dock::BAR_X0) - 4.0, y),
+                label,
+                &blend(p.bg, label_c, ta),
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            if !skip_figure {
+                SelectObject(hdc, figure_font);
+                draw_text_in(
+                    hdc,
+                    row_rect(cx(dock::BAR_X1), cx(dock::FIGURE_R) + slide, y),
+                    figure,
+                    &blend(p.bg, fig_c, ta),
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
+            if let Some(reset) = reset {
+                SelectObject(hdc, reset_font);
+                draw_text_in(
+                    hdc,
+                    row_rect(cx(dock::FIGURE_R) + 4.0, cx(dock::RESET_R) + slide, y),
+                    reset,
+                    &blend(p.bg, p.muted, ta),
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                );
+            }
+        };
+        for (i, r) in rows.iter().enumerate() {
+            // The headline figure is drawn on its own until it has landed.
+            let travelling = headline == Some(i) && row_e(i) < 0.999;
+            text_row(
+                i,
+                cy(card.usage_y[i]),
+                r.label,
+                r.hue,
+                &r.figure,
+                figure_ink(r),
+                Some(r.reset),
+                travelling,
+            );
         }
+        for (j, (label, value)) in [("CPU", live.cpu), ("RAM", live.ram)]
+            .into_iter()
+            .enumerate()
+        {
+            text_row(
+                n + j,
+                cy(card.device_y[j]),
+                label,
+                p.muted,
+                &format!("{:.0}%", value.clamp(0.0, 100.0)),
+                p.ink,
+                None,
+                false,
+            );
+        }
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(label_font);
+        let _ = DeleteObject(figure_font);
+        let _ = DeleteObject(reset_font);
         let _ = GdiFlush();
     }
 
-    // The rings, with their own alpha. Over a transparent background the
-    // tracks and pace ticks are the ink at low opacity, so they read the same
-    // over the panel and over whatever is behind the widget.
-    //
-    // Collapsed, each ring sits on a disc of the panel colour that gives way
-    // to the panel itself as the hover fades it in. Without it the tracks were
-    // the ink at a sixth opacity, which all but vanished over a light or busy
-    // wallpaper and left a short arc floating on its own.
-    let mut rings = vec![Premul::default(); pixels.len()];
-    let d = px(RING_D as f64);
-    let disc = DISC_ALPHA * (1.0 - a);
-    for (origin, block) in [(l.usage, &readings[0]), (l.device, &readings[1])] {
-        let bands = block.each_ref().map(|b| {
-            b.as_ref().map(|(band, _)| RingBand {
-                percent: band.percent,
-                fill: band.fill,
-                track: ink,
-                track_alpha: 0.16 + 0.12 * (1.0 - a),
-                tick: band
-                    .tick
-                    .map(|(pace, _)| (pace, pace_marker_color(is_dark))),
-                tick_alpha: 0.65,
-            })
-        });
-        let (ox, oy) = (px(origin[0]), px(origin[1]));
-        if disc > 0.003 {
-            paint_disc(
-                &mut rings,
-                width,
-                height,
-                (ox as f64 + d as f64 / 2.0, oy as f64 + d as f64 / 2.0),
-                d as f64 / 2.0 + DISC_MARGIN * s,
-                bg,
-                ink,
-                disc,
-            );
+    // ---- Rings and bars, with their own alpha --------------------------------
+    let mut layer = vec![Premul::default(); pixels.len()];
+    let mut cov = Coverage::new(width, height);
+    let bar_len = cx(dock::BAR_X1 - dock::BAR_X0);
+    let period = 4.0 * s;
+    let load = |v: f64, base: Color| {
+        if p.hatch_only || v <= 60.0 {
+            base
+        } else if v <= 85.0 {
+            blend(base, p.over_pace, (v - 60.0) / 25.0)
+        } else {
+            blend(p.over_pace, p.far_over, (v - 85.0) / 15.0)
         }
-        let ring = ring_pixels(
-            d,
-            RING_STROKE as f64 * s,
-            RING_GAP as f64 * s,
-            bands.each_ref().map(Option::as_ref),
-            0.0,
+    };
+    for (i, r) in rows.iter().enumerate() {
+        let ei = smooth(row_e(i));
+        let tape = Tape::new(
+            (usage_c.0, usage_c.1, ring_r(i)),
+            (cx(dock::BAR_X0), cy(card.usage_y[i]), bar_len),
+            ei,
         );
-        for ry in 0..d {
-            let y = oy + ry;
-            if y < 0 || y >= height {
-                continue;
+        let half = (stroke + (BAR_STROKE - stroke) * ei) / 2.0 * s;
+        cov.stroke(&tape.points(0.0, tape.len, s), half);
+        cov.lay(&mut layer, p.track, 1.0, 0.0, period);
+        if !r.reading {
+            continue;
+        }
+        let fade = if stale { 0.45 } else { 1.0 };
+        let fill_to = r.pct / 100.0 * tape.len;
+        match r.pace {
+            Some(q) if r.severity > 0 && r.pct > q => {
+                // Within pace: the warning colour collapsed, the window's own
+                // colour as a bar; past it, the warning colour, hatched.
+                let pace_at = q / 100.0 * tape.len;
+                cov.stroke(&tape.points(0.0, pace_at, s), half);
+                cov.lay(&mut layer, blend(r.state, r.hue, ei), fade, 0.0, period);
+                cov.stroke(&tape.points(pace_at, fill_to, s), half);
+                let hatch = if p.hatch_only { 1.0 } else { ei };
+                cov.lay(&mut layer, r.state, fade, hatch, period);
             }
-            for rx in 0..d {
-                let x = ox + rx;
-                if x < 0 || x >= width {
-                    continue;
-                }
-                let p = ring[(ry * d + rx) as usize];
-                if p.a > 0.0 {
-                    let i = (y * width + x) as usize;
-                    rings[i] = p.over(rings[i]);
-                }
+            _ => {
+                cov.stroke(&tape.points(0.0, fill_to, s), half);
+                cov.lay(&mut layer, r.state, fade, 0.0, period);
             }
+        }
+        if let Some(q) = r.pace {
+            // The pace mark: a short slash across the ring, a notch across
+            // the bar.
+            let (x, y, dir) = tape.at(q / 100.0 * tape.len);
+            // Short on the ring, so it stays clear of the figure inside it.
+            let reach =
+                (stroke / 2.0 + 0.8) + ((BAR_STROKE / 2.0 + 3.5) - (stroke / 2.0 + 0.8)) * ei;
+            let (nx, ny) = (-dir.sin(), dir.cos());
+            cov.stroke(
+                &[
+                    ((x - nx * reach) * s, (y - ny * reach) * s),
+                    ((x + nx * reach) * s, (y + ny * reach) * s),
+                ],
+                (0.85 + 0.15 * ei) * s,
+            );
+            cov.lay(&mut layer, p.tick, 0.9, 0.0, period);
+        }
+    }
+    for (j, (value, base)) in [(live.cpu, p.cpu), (live.ram, p.ram)]
+        .into_iter()
+        .enumerate()
+    {
+        let ei = smooth(row_e(n + j));
+        let tape = Tape::new(
+            (device_c.0, device_c.1, ring_r(j)),
+            (cx(dock::BAR_X0), cy(card.device_y[j]), bar_len),
+            ei,
+        );
+        let half = (stroke + (BAR_STROKE - stroke) * ei) / 2.0 * s;
+        cov.stroke(&tape.points(0.0, tape.len, s), half);
+        cov.lay(&mut layer, p.track, 1.0, 0.0, period);
+        let v = value.clamp(0.0, 100.0);
+        cov.stroke(&tape.points(0.0, v / 100.0 * tape.len, s), half);
+        cov.lay(&mut layer, load(v, base), 1.0, 0.0, period);
+    }
+
+    // ---- The headline figure, travelling from the rings to its row -----------
+    let mut figure: Option<(Vec<f32>, i32, i32, i32, i32, Color)> = None;
+    if let Some(i) = headline {
+        let ei = smooth(row_e(i));
+        if ei < 0.999 {
+            let r = &rows[i];
+            let size = 12.0 + (13.0 - 12.0) * ei;
+            let weight = if ei < 0.5 { FW_BOLD } else { FW_SEMIBOLD };
+            let (mask, mw, mh) = text_coverage(hdc, &r.figure, -(size * s).round() as i32, weight);
+            // Centred in the rings collapsed, right-aligned in its row open.
+            let from_x = usage_c.0 * s - mw as f64 / 2.0;
+            let to_x = cx(dock::FIGURE_R) * s - mw as f64;
+            let mid_y = (usage_c.1 + (cy(card.usage_y[i]) - usage_c.1) * ei) * s;
+            let x = (from_x + (to_x - from_x) * ei).round() as i32;
+            let y = (mid_y - mh as f64 / 2.0).round() as i32;
+            figure = Some((mask, mw, mh, x, y, figure_ink(r)));
         }
     }
 
-    // Composite: the panel, rounded and faded by the hover, under the rings.
-    let r = PANEL_RADIUS * s;
-    let (w, h) = (width as f64, height as f64);
+    // ---- Composite -----------------------------------------------------------
+    // The panel: a pill collapsed (see-through on Solid, absent on Floating)
+    // that becomes the opaque card as the hover fades in.
+    let rest = if floating { 0.0 } else { PILL_ALPHA };
+    let panel_a = rest + (1.0 - rest) * a;
+    let radius = (l.pill[0].min(l.pill[1]) / 2.0
+        + (dock::CARD_RADIUS - l.pill[0].min(l.pill[1]) / 2.0) * smooth(e_all))
+        * s;
+    let (fw, fh) = (width as f64, height as f64);
+    let r = radius.min(fw / 2.0).min(fh / 2.0);
     for y in 0..height {
         for x in 0..width {
             let i = (y * width + x) as usize;
             let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
-            let corner = (cx - cx.clamp(r, w - r)).hypot(cy - cy.clamp(r, h - r));
-            let pa = (a * coverage(r - corner)) as f32;
+            let corner = (cx - cx.clamp(r, fw - r)).hypot(cy - cy.clamp(r, fh - r));
+            let pa = (panel_a * coverage(r - corner)) as f32;
             let rgb = pixels[i];
             let panel = Premul {
                 r: ((rgb >> 16) & 0xFF) as f32 * pa,
@@ -3028,7 +3337,18 @@ fn compose_docked(
                 b: (rgb & 0xFF) as f32 * pa,
                 a: pa,
             };
-            let out = rings[i].over(panel);
+            let mut out = layer[i].over(panel);
+            if let Some((mask, mw, mh, fx, fy, color)) = &figure {
+                let (tx, ty) = (x - fx, y - fy);
+                if tx >= 0 && ty >= 0 && tx < *mw && ty < *mh {
+                    let c = mask[(ty * mw + tx) as usize];
+                    if c > 0.0 {
+                        let mut t = Premul::default();
+                        t.paint(*color, c as f64);
+                        out = t.over(out);
+                    }
+                }
+            }
             let alpha = (out.a * 255.0).round().clamp(0.0, 255.0) as u32;
             pixels[i] = if alpha == 0 {
                 0x0100_0000
@@ -3062,7 +3382,7 @@ fn ring_readings<'a>(
 ) -> [[Option<(RingBand, RingRow<'a>)>; 3]; 2] {
     let appearance = appearance();
     let palette = appearance.palette(is_dark);
-    let custom = appearance.mode == Mode::Custom;
+    let custom = appearance.is_themed();
     let ink = palette[1];
     let ring_track = blend(bg, ink, 0.14);
     let lift = if is_dark {
@@ -5197,6 +5517,11 @@ fn make_font(px: i32, weight: FONT_WEIGHT) -> HFONT {
 /// A Segoe UI font at an already-scaled height, for callers that scale
 /// themselves (the appearance studio uses `dpi_sc`).
 pub(crate) fn create_font(height: i32, weight: FONT_WEIGHT) -> HFONT {
+    create_font_quality(height, weight, CLEARTYPE_QUALITY)
+}
+
+/// As create_font, at a chosen rendering quality.
+fn create_font_quality(height: i32, weight: FONT_WEIGHT, quality: FONT_QUALITY) -> HFONT {
     let name = native_interop::wide_str("Segoe UI");
     unsafe {
         CreateFontW(
@@ -5211,7 +5536,7 @@ pub(crate) fn create_font(height: i32, weight: FONT_WEIGHT) -> HFONT {
             DEFAULT_CHARSET.0 as u32,
             OUT_TT_PRECIS.0 as u32,
             CLIP_DEFAULT_PRECIS.0 as u32,
-            CLEARTYPE_QUALITY.0 as u32,
+            quality.0 as u32,
             (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
             PCWSTR::from_raw(name.as_ptr()),
         )
@@ -5489,7 +5814,7 @@ pub fn write_preview(
     CPU_SAMPLE.store(1800, Ordering::Relaxed);
     let width = total_widget_width();
     let height = widget_sc(WIDGET_HEIGHT);
-    let (bg, ink) = if appearance().mode == Mode::Custom {
+    let (bg, ink) = if appearance().is_themed() {
         let palette = appearance().palette(dark);
         (palette[0], palette[1])
     } else {
@@ -5566,21 +5891,26 @@ pub fn write_preview(
 }
 
 /// Render the floating widget over three wallpapers (light, busy and dark,
-/// left to right), side by side or `stacked`, collapsed or hovered and fully
-/// `expanded`, as a BMP.
+/// left to right), side by side or `stacked`, `expanded` of the way from
+/// collapsed to fully open, as a BMP.
 pub fn write_docked_preview(
     path: &str,
     dark: bool,
     no_session: bool,
     stale: bool,
     stacked: bool,
-    expanded: bool,
+    expanded: f64,
 ) -> std::io::Result<()> {
     CURRENT_DPI.store(192, Ordering::Relaxed);
     WIDGET_SIZE.store(WIDGET_SIZE_DEFAULT, Ordering::Relaxed);
     let scale = 2.0;
-    let open = if expanded { 1.0 } else { 0.0 };
-    let layout = dock::layout(if stacked { 1.0 } else { 0.0 }, open, false);
+    let open = expanded.clamp(0.0, 1.0);
+    let texts = [if no_session { "n/a" } else { "3h 12m" }, "4d 8h", "5d 2h"];
+    let layout = dock::layout(
+        if stacked { 1.0 } else { 0.0 },
+        open,
+        usage_slots(texts).len(),
+    );
     let frame = dock::Frame {
         left: 0.0,
         top: 0.0,
@@ -5588,7 +5918,6 @@ pub fn write_docked_preview(
         height: layout.h * scale,
         scale,
         layout,
-        stacked: if stacked { 1.0 } else { 0.0 },
         expanded: open,
         hover: open,
         // An edge whose expanded form has its figures right of the rings.
@@ -5649,7 +5978,7 @@ pub fn write_docked_preview(
             &frame,
             &live,
             dark,
-            [if no_session { "n/a" } else { "3h 12m" }, "4d 8h", "5d 2h"],
+            texts,
             [(!no_session).then_some(45.0), Some(65.0), Some(41.0)],
             stale,
         );

@@ -45,7 +45,7 @@ fn main() {
         }
     }
     // Offline UI harness: no credentials, network calls, tray icon or settings writes.
-    // --palette N renders with the Nth appearance preset as a custom theme;
+    // --palette N renders with the Nth theme preset;
     // --docked renders the collapsed floating widget over sample wallpapers,
     // or the hovered one with --expanded.
     if let Some(index) = args.iter().position(|arg| arg == "--preview") {
@@ -57,11 +57,9 @@ fn main() {
             .and_then(|n| n.parse::<usize>().ok())
             .and_then(|n| appearance::PRESETS.get(n))
         {
-            window::set_preview_appearance(appearance::Appearance {
-                mode: appearance::Mode::Custom,
-                colors: preset.1,
-                ..Default::default()
-            });
+            let mut a = appearance::Appearance::default();
+            a.use_theme(preset.id);
+            window::set_preview_appearance(a);
         }
         let result = args
             .get(index + 1)
@@ -74,7 +72,12 @@ fn main() {
                         flag("--no-session"),
                         flag("--stale"),
                         flag("--stacked"),
-                        flag("--expanded"),
+                        // --expanded opens it fully; --morph T part way.
+                        args.iter()
+                            .position(|a| a == "--morph")
+                            .and_then(|i| args.get(i + 1))
+                            .and_then(|t| t.parse::<f64>().ok())
+                            .unwrap_or(if flag("--expanded") { 1.0 } else { 0.0 }),
                     )
                 } else {
                     window::write_preview(

@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Widget Sandbox</title>
+<style>
+  :root {
+    --page: #e9ecf0;
+    --panel: #ffffff;
+    --ink: #1f2328;
+    --muted: #5d6670;
+    --line: #d5dae0;
+    --accent: #0e7490;
+    --on-accent: #ffffff;
+    --field: #f3f5f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --page: #0c0e10;
+      --panel: #16191d;
+      --ink: #e6e9ec;
+      --muted: #98a1aa;
+      --line: #2a2f35;
+      --accent: #22d3ee;
+      --on-accent: #06181c;
+      --field: #1e2227;
+    }
+  }
+  :root[data-theme="dark"] {
+    --page: #0c0e10;
+    --panel: #16191d;
+    --ink: #e6e9ec;
+    --muted: #98a1aa;
+    --line: #2a2f35;
+    --accent: #22d3ee;
+    --on-accent: #06181c;
+    --field: #1e2227;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--page); color: var(--ink);
+    font: 13px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    display: grid; grid-template-columns: minmax(0, 1fr) 320px; height: 100dvh; overflow: hidden;
+  }
+  @media (max-width: 860px) {
+    body { grid-template-columns: 1fr; grid-template-rows: 64vh auto; height: auto; overflow: auto; }
+  }
+
+  /* The simulated desktop */
+  .stage { position: relative; overflow: hidden; padding: 16px; user-select: none; -webkit-user-select: none; }
+  .monitor {
+    position: absolute; inset: 16px 16px 40px; border-radius: 6px; overflow: hidden;
+    box-shadow: 0 0 0 1px rgba(0,0,0,.35), 0 14px 40px rgba(0,0,0,.28);
+  }
+  .monitor.w-light { background: #dfe3e8; }
+  .monitor.w-dark { background: #101216; }
+  .monitor.w-busy { background: repeating-linear-gradient(135deg, #e9c46a 0 16px, #7aa0d4 16px 32px); }
+  .monitor.w-photo { background: radial-gradient(120% 90% at 20% 10%, #f4a261 0%, #c2557a 38%, #2a2d5c 75%, #12142b 100%); }
+  .taskbar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 44px;
+    background: rgba(32,32,36,.82); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px);
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+  }
+  .taskbar i { width: 26px; height: 26px; border-radius: 5px; background: rgba(255,255,255,.16); display: block; }
+  .taskbar i:first-child { background: rgba(96,165,250,.7); }
+  .taskbar .clock { position: absolute; right: 14px; color: rgba(255,255,255,.85); font-size: 11px; text-align: right; line-height: 1.25; font-variant-numeric: tabular-nums; }
+  .edge-hint { position: absolute; pointer-events: none; border-radius: 3px; background: rgba(34,211,238,.0); transition: background .15s; }
+  .edge-hint.on { background: rgba(34,211,238,.55); }
+  .statusline {
+    position: absolute; left: 16px; right: 16px; bottom: 10px; font-size: 12px; color: var(--muted);
+    display: flex; gap: 14px; flex-wrap: wrap; pointer-events: none; font-variant-numeric: tabular-nums;
+  }
+  #wsvg { position: absolute; overflow: visible; pointer-events: none; z-index: 5; }
+  #hit { pointer-events: all; cursor: grab; touch-action: none; }
+  #hit.dragging { cursor: grabbing; }
+  .wtext { font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+
+  /* The panel */
+  .panel { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 16px 16px 28px; }
+  @media (max-width: 860px) { .panel { border-left: 0; border-top: 1px solid var(--line); } }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 6px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+  .field { margin-bottom: 9px; }
+  .field > span { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+  .field output { color: var(--ink); font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--accent); margin: 0; }
+  .seg { display: flex; flex-wrap: wrap; gap: 4px; }
+  .seg button, .btn {
+    font: inherit; font-size: 12px; padding: 4px 9px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--field); color: var(--ink);
+  }
+  .seg button[aria-pressed=true] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+  .btn:hover, .seg button:hover { border-color: var(--accent); }
+  .check { display: flex; gap: 7px; align-items: center; margin: 5px 0; cursor: pointer; }
+  .group { border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px 2px; margin-bottom: 8px; }
+  .group-title { display: flex; align-items: center; gap: 6px; font-weight: 600; margin-bottom: 6px; }
+  .swatch { width: 9px; height: 9px; border-radius: 50%; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .note { font-size: 12px; color: var(--muted); margin: 6px 0 0; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  kbd { font: 11px ui-monospace, monospace; padding: 0 4px; border: 1px solid var(--line); border-radius: 3px; }
+
+  /* Theme section */
+  #glass { position: absolute; z-index: 4; pointer-events: none; display: none;
+    -webkit-backdrop-filter: blur(22px) saturate(1.4); backdrop-filter: blur(22px) saturate(1.4); }
+  .gallery { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .gcard {
+    font: inherit; font-size: 12px; text-align: left; cursor: pointer; padding: 6px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--field); color: var(--ink); display: flex; flex-direction: column; gap: 5px;
+  }
+  .gcard[aria-pressed=true] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .gcard svg { display: block; width: 100%; height: auto; border-radius: 5px; }
+  .gcard .gname { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+  .gcard .gname small { font-weight: 400; color: var(--muted); }
+  .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+  .role { display: flex; align-items: center; gap: 7px; font-size: 12px; cursor: pointer; }
+  .role input[type=color] { width: 26px; height: 22px; padding: 0; border: 1px solid var(--line); border-radius: 5px; background: none; cursor: pointer; flex: none; }
+  .role code { font: 11px ui-monospace, monospace; color: var(--muted); }
+  .role.off { opacity: .4; }
+  .contrast { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .contrast td { padding: 2px 0; border-bottom: 1px solid var(--line); }
+  .contrast td:nth-child(2), .contrast td:nth-child(3) { text-align: right; }
+  .ok { color: #16a34a; } .bad { color: #d97706; font-weight: 600; }
+  .themename { font-weight: 600; color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="stage" id="stage">
+  <div class="monitor w-photo" id="monitor">
+    <div class="taskbar" id="taskbar"><i></i><i></i><i></i><i></i><i></i><div class="clock" id="clock"></div></div>
+    <div class="edge-hint" id="hint"></div>
+  </div>
+  <div id="glass"></div>
+  <svg id="wsvg" aria-label="Usage widget">
+    <defs>
+      <pattern id="hatch" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <rect width="1.7" height="4" fill="rgba(0,0,0,.38)"/>
+      </pattern>
+      <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+        <feDropShadow dx="0" dy="4" stdDeviation="6" flood-color="#000" flood-opacity=".28"/>
+      </filter>
+    </defs>
+    <g id="lift">
+      <g id="content"></g>
+      <rect id="hit" fill="transparent"/>
+    </g>
+  </svg>
+  <div class="statusline" id="statusline"></div>
+</div>
+
+<aside class="panel">
+  <h1>Widget sandbox</h1>
+  <p class="sub">Hover the widget to expand it. Drag it anywhere, or throw it at an edge to dock it. Time runs fast, so polls, count-ups, pace and resets play out live.</p>
+
+  <h2>Theme · <span class="themename" id="themeName"></span></h2>
+  <div class="gallery" id="gallery"></div>
+
+  <h2>Colours</h2>
+  <div class="roles" id="roles"></div>
+  <div class="field" style="margin-top:10px"><span>Window colours</span><div class="seg" id="accents"></div></div>
+  <div class="field"><span>Warning colours</span><div class="seg" id="states"></div></div>
+  <div class="field"><span>Background</span><div class="seg" id="material"></div></div>
+  <p class="note" id="materialNote"></p>
+
+  <h2>Contrast</h2>
+  <table class="contrast" id="contrast"></table>
+  <p class="note">Text needs 4.5:1 against the background; a bar needs 3:1. Labels are drawn in their window's colour, so each accent is held to the text bar.</p>
+  <div class="row" style="margin-top:8px"><button class="btn" id="copyTheme">Copy theme as settings</button><span class="note" id="copied"></span></div>
+
+  <h2>Plan</h2>
+  <label class="check"><input type="checkbox" id="has5h"> Plan has a 5h window</label>
+  <label class="check"><input type="checkbox" id="hasFable" checked> Account reports Fable</label>
+
+  <h2>Simulation</h2>
+  <div class="field"><span>Speed</span><div class="seg" id="speed"></div></div>
+  <div class="field"><span>Update frequency</span><div class="seg" id="poll"></div></div>
+  <div class="field"><span>Your activity</span><div class="seg" id="activity"></div></div>
+  <div class="field"><span>Connection</span><div class="seg" id="conn"></div></div>
+  <div class="row"><button class="btn" id="pollNow">Poll now</button><button class="btn" id="resetPos">Reset position</button></div>
+
+  <h2>Readings</h2>
+  <div class="field"><span>Scenario</span><div class="seg" id="scenario"></div></div>
+  <div id="windows"></div>
+  <div class="pair">
+    <div class="field"><span>CPU <output id="o-cpu"></output></span><input type="range" id="cpu" min="0" max="100"></div>
+    <div class="field"><span>RAM <output id="o-ram"></output></span><input type="range" id="ram" min="0" max="100"></div>
+  </div>
+  <label class="check"><input type="checkbox" id="devWalk" checked> Let CPU and RAM wander</label>
+
+  <h2>Widget</h2>
+  <div class="field"><span>Wallpaper</span><div class="seg" id="wall"></div></div>
+  <div class="field"><span>Widget size <output id="o-size">100%</output></span><input type="range" id="size" min="75" max="200" step="5" value="100"></div>
+  <label class="check"><input type="checkbox" id="device" checked> Show the device rings</label>
+
+  <h2>Motion</h2>
+  <label class="check"><input type="checkbox" id="pin"> Keep expanded</label>
+  <label class="check"><input type="checkbox" id="slow"> Slow motion (4×)</label>
+  <label class="check"><input type="checkbox" id="scrub"> Scrub the morph by hand</label>
+  <div class="field"><span>Morph <output id="o-morph">0.00</output></span><input type="range" id="morph" min="0" max="1" step="0.005" value="0" disabled></div>
+  <p class="note">Collapsed, each window is a ring. Expanded, each ring unrolls into a straight pace bar: the notch is where an even spend would put you, and usage past it is hatched amber or red. With no 5h window the widget has two usage rings and two bars, 7d and Fable.</p>
+</aside>
+
+<script>
+(() => {
+  // ---------------------------------------------------------------- utilities
+  const $ = s => document.querySelector(s);
+  const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const hexRgb = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const mix = (a, b, t) => { const A = hexRgb(a), B = hexRgb(b); t = clamp(t); return '#' + A.map((v, i) => Math.round(v + (B[i] - v) * t).toString(16).padStart(2, '0')).join(''); };
+  const ease = t => t * t * (3 - 2 * t);
+  const H = 3600, DAY = 86400;
+
+  // A spring by response time (seconds) and damping ratio.
+  function spring(response, zeta) { const k = (2 * Math.PI / response) ** 2; return { k, c: 2 * zeta * Math.sqrt(k) }; }
+  function step(s, target, cfg, dt) {
+    const n = Math.max(1, Math.ceil(dt / 0.004)), h = dt / n;
+    for (let i = 0; i < n; i++) { const a = -cfg.k * (s.x - target) - cfg.c * s.v; s.v += a * h; s.x += s.v * h; }
+    return s;
+  }
+  const FOLLOW = spring(0.08, 1), SNAP = spring(0.45, 0.72), MORPH = spring(0.42, 0.9),
+        HOVER_IN = spring(0.42, 0.88), HOVER_OUT = spring(0.34, 1), LIFT = spring(0.22, 0.6), TWEEN = spring(0.55, 1);
+
+  // ------------------------------------------------------------------ themes
+  // A theme is eight colour roles. The muted text, tracks, ticks and hairlines
+  // are derived from background and text, so a theme can never pair a track
+  // that vanishes with its background. Amber from 8 points over pace, red from
+  // 18; device load warms continuously.
+  const ROLES = [
+    ['bg', 'Background'], ['ink', 'Text'], ['s5', '5h'], ['w7', '7d'],
+    ['fb', 'Fable'], ['dev', 'CPU'], ['ram', 'RAM'], ['warm', 'Over pace'], ['hot', 'Far over'],
+  ];
+  const PRESETS = [
+    { id: 'system', name: 'System', note: 'follows Windows' },
+    { id: 'graphite', name: 'Graphite', note: 'dark', bg: '#1c1c1e', ink: '#eceff2', s5: '#22D3EE', w7: '#38A3F5', fb: '#A78BFA', dev: '#34D399', warm: '#FBBF24', hot: '#F87171' },
+    { id: 'paper', name: 'Paper', note: 'light', bg: '#f7f7f8', ink: '#1d2125', s5: '#0891B2', w7: '#1D6FD8', fb: '#7C3AED', dev: '#059669', warm: '#B45309', hot: '#DC2626' },
+    { id: 'midnight', name: 'Midnight', note: 'yours today', bg: '#151923', ink: '#e7edf7', s5: '#F6C9A8', w7: '#F0AA87', fb: '#A6B9FF', dev: '#74D8D3', warm: '#FFD27A', hot: '#FF8A8A' },
+    { id: 'porcelain', name: 'Porcelain', note: 'light', bg: '#f6f3ed', ink: '#292d36', s5: '#B8683F', w7: '#9E4D32', fb: '#3859A8', dev: '#226C65', warm: '#A16207', hot: '#B91C1C' },
+    { id: 'evergreen', name: 'Evergreen', note: 'dark', bg: '#122522', ink: '#e0eee6', s5: '#F2D2AE', w7: '#EAC098', fb: '#8FCADA', dev: '#88D9B4', warm: '#F5C451', hot: '#F59090' },
+    { id: 'afterglow', name: 'Afterglow', note: 'dark', bg: '#281d2c', ink: '#f8e5ee', s5: '#FFD0B0', w7: '#FFB98F', fb: '#D3AFFF', dev: '#F19ABF', warm: '#FFD166', hot: '#FF7A90' },
+    { id: 'mono', name: 'Mono', note: 'trouble only', accents: 'mono', bg: '#18181a', ink: '#f1f1f1', s5: '#d0d0d0', w7: '#d0d0d0', fb: '#d0d0d0', dev: '#d0d0d0', warm: '#FBBF24', hot: '#F87171' },
+    // Two-tone themes: the warnings step outside the theme's own hue family,
+    // since gold already means usage in one and red in the other.
+    { id: 'gold', name: 'Black & gold', note: 'dark', bg: '#0b0b0c', ink: '#f3ead2', s5: '#F7D774', w7: '#D4AF37', fb: '#B07A3B', dev: '#E5E4E2', ram: '#7D8C99', warm: '#FF5A4E', hot: '#E0245E' },
+    { id: 'redwhite', name: 'Red & white', note: 'light', bg: '#ffffff', ink: '#1a1a1a', s5: '#F04A55', w7: '#D7192A', fb: '#8E0E1B', dev: '#6B6B6B', warm: '#A86F00', hot: '#111827' },
+    { id: 'contrast', name: 'High contrast', note: 'dark', bg: '#000000', ink: '#ffffff', s5: '#00E5FF', w7: '#4DA3FF', fb: '#C79BFF', dev: '#3DFF9E', warm: '#FFD400', hot: '#FF5C5C' },
+  ];
+  const presetById = id => PRESETS.find(p => p.id === id);
+  const THEME = { base: 'midnight', roles: { ...presetById('midnight') }, accents: 'hues', states: 'theme', material: 'solid' };
+  const systemDark = () => { try { return matchMedia('(prefers-color-scheme: dark)').matches; } catch { return true; } };
+  const resolvedRoles = () => THEME.base === 'system' ? presetById(systemDark() ? 'graphite' : 'paper') : THEME.roles;
+  const isDarkBg = hex => { const [r, g, b] = hexRgb(hex); return 299 * r + 587 * g + 114 * b < 128000; };
+
+  function palFor(r, accents, states, keys) {
+    const dark = isDarkBg(r.bg);
+    const p = {
+      // RAM is its own colour, or by default a deeper shade of CPU, so the two
+      // device rings never read as one.
+      dark, bg: r.bg, ink: r.ink, dev: r.dev, ram: r.ram || (dark ? mix(r.dev, r.bg, 0.35) : mix(r.dev, '#000000', 0.3)),
+      muted: mix(r.bg, r.ink, 0.62), track: mix(r.bg, r.ink, 0.16), tick: mix(r.bg, r.ink, 0.9), off: mix(r.bg, r.ink, 0.38),
+      edge: dark ? 'rgba(255,255,255,.09)' : 'rgba(0,0,0,.10)', flash: dark ? '#ffffff' : '#000000',
+      s5: r.s5, w7: r.w7, fb: r.fb, noState: states === 'none',
+    };
+    if (states === 'cvd') { p.warm = dark ? '#FFB000' : '#8F5F00'; p.hot = dark ? '#FF5FA2' : '#B5136A'; }
+    else { p.warm = r.warm; p.hot = r.hot; }
+    if (accents === 'mono') {
+      const m = mix(r.bg, r.ink, 0.78); p.s5 = p.w7 = p.fb = p.dev = m; p.ram = mix(r.bg, r.ink, 0.5);
+    } else if (accents === 'shades') {
+      // One accent (the 7d colour), deeper for each ring further in.
+      keys.forEach((k, i) => { p[k] = dark ? mix(r.w7, r.bg, 0.3 * i) : mix(r.w7, '#000000', 0.22 * i); });
+    }
+    return p;
+  }
+  const pal = () => palFor(resolvedRoles(), THEME.accents, THEME.states, activeKeys());
+  const stateOf = burn => burn >= 18 ? 'hot' : burn >= 8 ? 'warm' : 'calm';
+  const loadColor = (p, v, base = p.dev) => p.noState ? base : v <= 60 ? base : v <= 85 ? mix(base, p.warm, (v - 60) / 25) : mix(p.warm, p.hot, (v - 85) / 15);
+
+  // WCAG contrast
+  const lin = c => { c /= 255; return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; };
+  const lum = hex => { const [r, g, b] = hexRgb(hex).map(lin); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+  const contrast = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m); return (x + 0.05) / (y + 0.05); };
+
+  // --------------------------------------------------------------- the model
+  const DEFS = {
+    s5: { label: '5h', len: 5 * H, rate: { idle: 0, steady: 9, heavy: 28 } },
+    w7: { label: '7d', len: 7 * DAY, rate: { idle: 0, steady: 0.45, heavy: 1.4 } },
+    fb: { label: 'Fable', len: 7 * DAY, rate: { idle: 0, steady: 0.3, heavy: 1.1 } },
+  };
+  const SIM = {
+    t: 0, speed: 60, poll: 60, activity: 'steady', conn: 'live',
+    lastPoll: 0, lastGood: 0, has5h: false, hasFable: true,
+    win: {
+      s5: { used: 32, start: -0.40 * 5 * H },
+      w7: { used: 58, start: -0.65 * 7 * DAY },
+      fb: { used: 38, start: -0.41 * 7 * DAY },
+    },
+    cpu: 18, ram: 42, devWalk: true,
+  };
+  // What the widget last received, and what it is showing (tweened).
+  const READ = { s5: null, w7: null, fb: null };
+  const SHOW = {}; for (const k in DEFS) SHOW[k] = { pct: { x: 0, v: 0 }, pace: { x: 0, v: 0 }, flash: 0 };
+  const DEV = { cpu: { x: 18, v: 0 }, ram: { x: 42, v: 0 } };
+
+  const paceOf = k => clamp((SIM.t - SIM.win[k].start) / DEFS[k].len * 100, 0, 100);
+  const remainingOf = k => SIM.win[k].start + DEFS[k].len - SIM.t;
+  function fmtLeft(s) {
+    s = Math.max(0, s);
+    if (s >= DAY) return `${Math.floor(s / DAY)}d ${Math.floor(s % DAY / H)}h`;
+    if (s >= H) return `${Math.floor(s / H)}h ${Math.floor(s % H / 60)}m`;
+    return `${Math.max(1, Math.ceil(s / 60))}m`;
+  }
+  const activeKeys = () => ['s5', 'w7', 'fb'].filter(k => (k !== 's5' || SIM.has5h) && (k !== 'fb' || SIM.hasFable));
+
+  function poll() {
+    SIM.lastPoll = SIM.t;
+    if (SIM.conn === 'failing') return;           // keep the last reading on screen
+    for (const k of activeKeys()) {
+      if (SIM.conn === 'signedout') { READ[k] = { valid: false }; continue; }
+      const used = SIM.win[k].used, pace = paceOf(k);
+      const prev = READ[k];
+      if (prev && prev.valid && Math.round(prev.used) !== Math.round(used)) SHOW[k].flash = 1;
+      READ[k] = { valid: true, used, pace };
+    }
+    if (SIM.conn === 'live') SIM.lastGood = SIM.t;
+  }
+  const isStale = () => SIM.conn === 'failing' && SIM.t - SIM.lastGood >= Math.max(3 * SIM.poll, 600);
+
+  function simulate(dtSim) {
+    SIM.t += dtSim;
+    let reset = false;
+    for (const k of Object.keys(DEFS)) {
+      const w = SIM.win[k];
+      w.used = clamp(w.used + DEFS[k].rate[SIM.activity] * dtSim / H, 0, 100);
+      while (SIM.t - w.start >= DEFS[k].len) { w.start += DEFS[k].len; w.used = 0; reset = true; }
+    }
+    // A passed reset polls at once, as the app does.
+    if (reset || SIM.t - SIM.lastPoll >= SIM.poll) poll();
+  }
+
+  // ------------------------------------------------------------------- layout
+  // Base units, before WIDGET SIZE. Collapsed: one 60px disc per ring cluster
+  // inside a pill; expanded: a card of rows.
+  const D = 60, PADC = 4, GAPC = 6, PR = D / 2 + PADC;
+  const W = 316, LABEL_X = 14, BAR_X0 = 54, BAR_X1 = 194, FIG_R = 240, RESET_R = 302;
+  const TOP = 23, STEP = 24, DSTEP = 22;
+  const BAR_SW = 6;
+
+  function ringSpec(n) {
+    if (n >= 3) return { r: [25.5, 18, 10.5], sw: [5, 5, 5] };
+    if (n === 2) return { r: [25.5, 16.5], sw: [6, 6] };
+    return { r: [24], sw: [7] };
+  }
+  const centerFigure = n => n <= 2;
+
+  function geometry(stackedT, device, nUsage) {
+    const pillW = device ? lerp(2 * D + GAPC + 2 * PADC, D + 2 * PADC, stackedT) : D + 2 * PADC;
+    const pillH = device ? lerp(D + 2 * PADC, 2 * D + GAPC + 2 * PADC, stackedT) : D + 2 * PADC;
+    const uc = [PR, PR];
+    const dc = [lerp(PR + D + GAPC, PR, stackedT), lerp(PR, PR + D + GAPC, stackedT)];
+    const lastUsageY = TOP + (nUsage - 1) * STEP;
+    const sepY = lastUsageY + 17;
+    const devY = [sepY + 17, sepY + 17 + DSTEP];
+    const cardH = device ? devY[1] + 18 : lastUsageY + 19;
+    return { pillW, pillH, uc, dc, rowsY: Array.from({ length: nUsage }, (_, i) => TOP + i * STEP), sepY, devY, cardH };
+  }
+
+  // A track that is a ring at e=0 and a straight bar at e=1, unrolled like a
+  // tape measure: it starts at the ring's top heading right (clockwise), a
+  // straight run grows from that start, and what is left stays a tightening
+  // curl at the run's end, so the shape never sweeps outside the card.
+  function track(ring, bar, e) {
+    const ax = lerp(ring.cx, bar.x, e), ay = lerp(ring.cy - ring.r, bar.y, e);
+    const L = lerp(2 * Math.PI * ring.r, bar.len, e);
+    const rho = ring.r * (1 - 0.55 * e);
+    const curl = 2 * Math.PI * (1 - e) * rho;
+    const run = Math.max(0, L - curl);
+    const at = s => {
+      if (s <= run || rho < 1e-6) return [ax + s, ay, 0];
+      const a = (s - run) / rho;
+      return [ax + run + rho * Math.sin(a), ay + rho * (1 - Math.cos(a)), a];
+    };
+    const path = (s0, s1) => {
+      s0 = clamp(s0, 0, L); s1 = clamp(s1, 0, L);
+      if (s1 - s0 < 0.01) return '';
+      const n = Math.max(2, Math.ceil((s1 - s0) / 2.5));
+      let d = '';
+      for (let i = 0; i <= n; i++) { const [x, y] = at(s0 + (s1 - s0) * i / n); d += (i ? 'L' : 'M') + x.toFixed(2) + ' ' + y.toFixed(2); }
+      return d;
+    };
+    return { L, at, path, sw: lerp(ring.sw, BAR_SW, e) };
+  }
+
+  // ------------------------------------------------------------------ widget
+  const UI = {
+    size: 1, theme: 'dark', device: true, pin: false, slow: false, scrub: false, scrubE: 0,
+    pos: { x: { x: 0, v: 0 }, y: { x: 0, v: 0 } },
+    dock: { side: 'bottom', along: 0.78 }, floatAt: null,
+    stacked: { x: 0, v: 0 }, expand: { x: 0, v: 0 }, lift: { x: 1, v: 0 },
+    ax: { x: 1, v: 0 }, ay: { x: 1, v: 0 },
+    hovered: false, leftAt: -1, dragging: false, drag: null,
+  };
+  const M = 360; // room around the pill for the expanded card
+  const svg = $('#wsvg'), content = $('#content'), hit = $('#hit'), liftG = $('#lift');
+  const ctx = document.createElement('canvas').getContext('2d');
+  const textW = (s, fs, wt = 600) => { ctx.font = `${wt} ${fs}px "Segoe UI Variable Display","Segoe UI",system-ui,sans-serif`; return ctx.measureText(s).width; };
+
+  function work() {
+    const mon = $('#monitor').getBoundingClientRect(), st = $('#stage').getBoundingClientRect();
+    return { x0: mon.left - st.left, y0: mon.top - st.top, x1: mon.right - st.left, y1: mon.bottom - st.top - 44 };
+  }
+  const MARGIN = 6;
+  function dockTarget(g) {
+    const wa = work(), s = UI.size, w = g.pillW * s, h = g.pillH * s, side = UI.dock.side;
+    if (!side) {
+      const f = UI.floatAt || { x: wa.x0 + 40, y: wa.y0 + 40 };
+      return [clamp(f.x, wa.x0, wa.x1 - w), clamp(f.y, wa.y0, wa.y1 - h)];
+    }
+    const along = UI.dock.along;
+    if (side === 'left' || side === 'right') {
+      const y = clamp(lerp(wa.y0, wa.y1, along) - h / 2, wa.y0 + MARGIN, wa.y1 - h - MARGIN);
+      return [side === 'left' ? wa.x0 + MARGIN : wa.x1 - w - MARGIN, y];
+    }
+    const x = clamp(lerp(wa.x0, wa.x1, along) - w / 2, wa.x0 + MARGIN, wa.x1 - w - MARGIN);
+    return [x, side === 'top' ? wa.y0 + MARGIN : wa.y1 - h - MARGIN];
+  }
+
+  function headlineKey(keys) {
+    const sev = { hot: 2, warm: 1, calm: 0 };
+    let best = keys[0], bs = -1;
+    for (const k of keys) {
+      const r = READ[k]; if (!r || !r.valid) continue;
+      const s = sev[stateOf(SHOW[k].pct.x - SHOW[k].pace.x)];
+      if (s > bs) { bs = s; best = k; }
+    }
+    return best;
+  }
+
+  function render() {
+    const p = pal(), keys = activeKeys(), n = keys.length;
+    const t = clamp(UI.stacked.x), eAll = UI.scrub ? UI.scrubE : clamp(UI.expand.x);
+    const g = geometry(t, UI.device, n), spec = ringSpec(n), s = UI.size;
+    const ax = clamp(UI.ax.x), ay = clamp(UI.ay.x);
+    const cx0 = (g.pillW - W) * ax, cy0 = (g.pillH - g.cardH) * ay;     // the expanded card's corner
+    // The card leads the morph so the unrolling tracks always land inside it.
+    const e = ease(clamp(eAll * 1.35));
+    const card = {
+      x: lerp(0, cx0, e), y: lerp(0, cy0, e), w: lerp(g.pillW, W, e), h: lerp(g.pillH, g.cardH, e),
+    };
+    card.r = Math.min(lerp(PR, 10, e), card.w / 2, card.h / 2);
+    const stale = isStale(), signedOut = SIM.conn === 'signedout';
+    const rows = n + (UI.device ? 2 : 0), DELAY = 0.07;
+    const rowE = i => clamp((eAll - 0.08 - DELAY * i) / (0.92 - DELAY * (rows - 1)));
+    const head = headlineKey(keys);
+    let out = '';
+
+    // Card
+    // Background material: solid, glass (translucent over a blur), or floating
+    // rings with no backing until the card opens.
+    const mat = THEME.material;
+    const fillOp = mat === 'glass' ? lerp(0.5, 0.66, e) : mat === 'float' ? lerp(0, 0.95, e) : lerp(0.8, 0.95, e);
+    const edgeOp = mat === 'float' ? e : 1;
+    out += `<rect x="${card.x}" y="${card.y}" width="${card.w}" height="${card.h}" rx="${card.r}" fill="${p.bg}" fill-opacity="${fillOp}" stroke="${p.edge}" stroke-opacity="${edgeOp}" ${mat === 'float' && e < 0.05 ? '' : 'filter="url(#shadow)"'}/>`;
+    const glass = $('#glass');
+    if (mat === 'glass') {
+      Object.assign(glass.style, {
+        display: 'block', left: UI.pos.x.x + card.x * s + 'px', top: UI.pos.y.x + card.y * s + 'px',
+        width: card.w * s + 'px', height: card.h * s + 'px', borderRadius: card.r * s + 'px',
+      });
+    } else glass.style.display = 'none';
+    // Poll freshness along the top edge, shown with the card
+    if (e > 0.02) {
+      const fx0 = card.x + card.r, fx1 = card.x + card.w - card.r;
+      const frac = SIM.conn === 'live' ? clamp((SIM.t - SIM.lastPoll) / SIM.poll) : 1;
+      out += `<g opacity="${clamp((e - 0.5) * 2)}"><line x1="${fx0}" y1="${card.y + 0.8}" x2="${fx1}" y2="${card.y + 0.8}" stroke="${p.track}" stroke-width="1.4"/>`
+           + `<line x1="${fx0}" y1="${card.y + 0.8}" x2="${lerp(fx0, fx1, frac)}" y2="${card.y + 0.8}" stroke="${p.muted}" stroke-width="1.4"/></g>`;
+      if (UI.device) out += `<line x1="${cx0 + 14}" y1="${cy0 + g.sepY}" x2="${cx0 + W - 14}" y2="${cy0 + g.sepY}" stroke="${p.track}" opacity="${clamp((e - 0.6) * 2.5)}"/>`;
+    }
+
+    // Usage tracks
+    keys.forEach((k, i) => {
+      const ei = ease(rowE(i)), ring = { cx: g.uc[0], cy: g.uc[1], r: spec.r[i], sw: spec.sw[i] };
+      const bar = { x: cx0 + BAR_X0, y: cy0 + g.rowsY[i], len: BAR_X1 - BAR_X0 };
+      const tr = track(ring, bar, ei), r = READ[k], valid = r && r.valid;
+      const pct = clamp(SHOW[k].pct.x, 0, 100), pace = clamp(SHOW[k].pace.x, 0, 100);
+      const state = valid ? stateOf(pct - pace) : 'calm';
+      const hue = p[k], stateCol = state === 'calm' || p.noState ? hue : p[state];
+      out += `<path d="${tr.path(0, tr.L)}" fill="none" stroke="${p.track}" stroke-width="${tr.sw}" stroke-linecap="round"/>`;
+      if (valid) {
+        const op = stale ? 0.45 : 1;
+        const sp = pct / 100 * tr.L, sq = pace / 100 * tr.L;
+        if (state === 'calm' || pct <= pace) {
+          out += `<path d="${tr.path(0, sp)}" fill="none" stroke="${stateCol}" stroke-width="${tr.sw}" stroke-linecap="round" opacity="${op}"/>`;
+        } else {
+          // Within pace: the warning colour collapsed, the window's own hue as a bar.
+          out += `<path d="${tr.path(0, sq)}" fill="none" stroke="${mix(stateCol, hue, ei)}" stroke-width="${tr.sw}" stroke-linecap="round" opacity="${op}"/>`;
+          const over = tr.path(sq, sp);
+          out += `<path d="${over}" fill="none" stroke="${stateCol}" stroke-width="${tr.sw}" stroke-linecap="round" opacity="${op}"/>`;
+          out += `<path d="${over}" fill="none" stroke="url(#hatch)" stroke-width="${tr.sw}" opacity="${(p.noState ? 1 : ei) * op}"/>`;
+        }
+        // Pace tick: a short slash on the ring, a full notch on the bar
+        const [tx, ty, th] = tr.at(sq), nx = -Math.sin(th), ny = Math.cos(th), half = lerp(tr.sw / 2 + 1.8, tr.sw / 2 + 3.5, ei);
+        out += `<line x1="${tx - nx * half}" y1="${ty - ny * half}" x2="${tx + nx * half}" y2="${ty + ny * half}" stroke="${p.tick}" stroke-width="${lerp(1.7, 2, ei)}" stroke-linecap="round"/>`;
+      }
+
+      // Row text
+      const ti = clamp((rowE(i) - 0.5) / 0.5), slide = (1 - ti) * -8;
+      const fig = valid ? `${Math.round(pct)}%` : '—';
+      const reset = signedOut ? 'Offline' : !r ? 'Waiting' : stale ? 'Stale' : fmtLeft(remainingOf(k));
+      const flash = SHOW[k].flash;
+      const figCol = mix(state === 'calm' || p.noState ? p.ink : stateCol, p.flash, flash * 0.6);
+      const rowY = cy0 + g.rowsY[i] + 4.3;
+      out += `<text class="wtext" x="${cx0 + LABEL_X + slide}" y="${rowY}" font-size="11" font-weight="600" fill="${valid ? hue : p.off}" opacity="${ti}">${DEFS[k].label}</text>`;
+      out += `<text class="wtext" x="${cx0 + RESET_R + slide}" y="${rowY}" font-size="11" text-anchor="end" fill="${p.muted}" opacity="${ti}">${reset}</text>`;
+      if (k === head && centerFigure(n)) {
+        // The headline figure travels from the ring centre to its row.
+        const fsC = n === 1 ? 13 : 12, fsE = 13.5, fs = lerp(fsC, fsE, ei);
+        const xc = g.uc[0] + textW(fig, fsC, 700) / 2, yc = g.uc[1] + fsC * 0.36;
+        out += `<text class="wtext" x="${lerp(xc, cx0 + FIG_R, ei)}" y="${lerp(yc, rowY + 0.6, ei)}" font-size="${fs}" font-weight="${ei > 0.5 ? 600 : 700}" text-anchor="end" fill="${figCol}" opacity="${stale ? 0.55 : 1}">${fig}</text>`;
+      } else {
+        out += `<text class="wtext" x="${cx0 + FIG_R + slide}" y="${rowY + 0.6}" font-size="13.5" font-weight="600" text-anchor="end" fill="${figCol}" opacity="${ti * (stale ? 0.55 : 1)}">${fig}</text>`;
+      }
+    });
+
+    // Device tracks
+    if (UI.device) {
+      [['CPU', DEV.cpu.x, 25.5, 6], ['RAM', DEV.ram.x, 16.5, 6]].forEach(([label, v, rr, sw], j) => {
+        const i = n + j, ei = ease(rowE(i));
+        const tr = track({ cx: g.dc[0], cy: g.dc[1], r: rr, sw }, { x: cx0 + BAR_X0, y: cy0 + g.devY[j], len: BAR_X1 - BAR_X0 }, ei);
+        const val = clamp(v, 0, 100), col = loadColor(p, val, label === 'RAM' ? p.ram : p.dev);
+        out += `<path d="${tr.path(0, tr.L)}" fill="none" stroke="${p.track}" stroke-width="${tr.sw}" stroke-linecap="round"/>`;
+        out += `<path d="${tr.path(0, val / 100 * tr.L)}" fill="none" stroke="${col}" stroke-width="${tr.sw}" stroke-linecap="round"/>`;
+        const ti = clamp((rowE(i) - 0.5) / 0.5), slide = (1 - ti) * -8, y = cy0 + g.devY[j] + 4.3;
+        out += `<text class="wtext" x="${cx0 + LABEL_X + slide}" y="${y}" font-size="11" font-weight="600" fill="${p.muted}" opacity="${ti}">${label}</text>`;
+        out += `<text class="wtext" x="${cx0 + FIG_R + slide}" y="${y + 0.6}" font-size="13.5" font-weight="600" text-anchor="end" fill="${p.ink}" opacity="${ti}">${Math.round(val)}%</text>`;
+      });
+    }
+    content.innerHTML = out;
+
+    // Hit area follows the card
+    hit.setAttribute('x', card.x); hit.setAttribute('y', card.y);
+    hit.setAttribute('width', card.w); hit.setAttribute('height', card.h); hit.setAttribute('rx', card.r);
+    hit.classList.toggle('dragging', UI.dragging);
+    const l = UI.lift.x, pcx = g.pillW / 2, pcy = g.pillH / 2;
+    liftG.setAttribute('transform', `translate(${pcx} ${pcy}) scale(${l}) translate(${-pcx} ${-pcy})`);
+
+    // Place the SVG so its origin is the pill's top-left corner
+    const span = 2 * D + GAPC + 2 * PADC + 2 * M;
+    svg.setAttribute('viewBox', `${-M} ${-M} ${span} ${span}`);
+    svg.style.width = svg.style.height = span * s + 'px';
+    svg.style.left = (UI.pos.x.x - M * s) + 'px';
+    svg.style.top = (UI.pos.y.x - M * s) + 'px';
+    return g;
+  }
+
+  // ------------------------------------------------------------- interaction
+  const hint = $('#hint');
+  function nearestEdge(px, py, w, h) {
+    const wa = work();
+    const d = { left: px - wa.x0, right: wa.x1 - (px + w), top: py - wa.y0, bottom: wa.y1 - (py + h) };
+    let side = 'left'; for (const k in d) if (d[k] < d[side]) side = k;
+    return { side, dist: d[side], wa };
+  }
+  function showHint(side, wa) {
+    if (!side) { hint.classList.remove('on'); return; }
+    const mon = $('#monitor').getBoundingClientRect(), st = $('#stage').getBoundingClientRect();
+    const ox = mon.left - st.left, oy = mon.top - st.top, T = 4;
+    const r = { left: [0, 0, T, wa.y1 - oy], right: [wa.x1 - ox - T, 0, T, wa.y1 - oy], top: [0, 0, wa.x1 - ox, T], bottom: [0, wa.y1 - oy - T, wa.x1 - ox, T] }[side];
+    Object.assign(hint.style, { left: r[0] + 'px', top: r[1] + 'px', width: r[2] + 'px', height: r[3] + 'px' });
+    hint.classList.add('on');
+  }
+
+  let lastG = null;
+  hit.addEventListener('pointerenter', () => { UI.hovered = true; });
+  hit.addEventListener('pointerleave', () => { UI.hovered = false; UI.leftAt = performance.now(); });
+  hit.addEventListener('pointerdown', ev => {
+    ev.preventDefault();
+    hit.setPointerCapture(ev.pointerId);
+    UI.drag = { id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, ox: UI.pos.x.x, oy: UI.pos.y.x, active: false, samples: [] };
+  });
+  hit.addEventListener('pointermove', ev => {
+    const d = UI.drag; if (!d || ev.pointerId !== d.id) return;
+    const dx = ev.clientX - d.sx, dy = ev.clientY - d.sy;
+    if (!d.active && Math.hypot(dx, dy) > 4) {
+      d.active = true; UI.dragging = true;
+      // Grab the collapsed pill where the pointer is, even from an expanded card.
+      const s = UI.size, st = $('#stage').getBoundingClientRect();
+      d.grabX = clamp(ev.clientX - st.left - UI.pos.x.x, 0, lastG.pillW * s);
+      d.grabY = clamp(ev.clientY - st.top - UI.pos.y.x, 0, lastG.pillH * s);
+    }
+    if (!d.active) return;
+    const st = $('#stage').getBoundingClientRect();
+    d.tx = ev.clientX - st.left - d.grabX; d.ty = ev.clientY - st.top - d.grabY;
+    const now = performance.now();
+    d.samples.push([now, d.tx, d.ty]); while (d.samples.length && now - d.samples[0][0] > 90) d.samples.shift();
+    const ne = nearestEdge(d.tx, d.ty, lastG.pillW * UI.size, lastG.pillH * UI.size);
+    showHint(ne.dist < 32 ? ne.side : null, ne.wa);
+  });
+  function endDrag(ev) {
+    const d = UI.drag; if (!d || ev.pointerId !== d.id) return;
+    UI.drag = null; showHint(null);
+    if (!d.active) return;
+    UI.dragging = false;
+    let vx = 0, vy = 0;
+    if (d.samples.length > 1) { const a = d.samples[0], b = d.samples[d.samples.length - 1], dt = (b[0] - a[0]) / 1000; if (dt > 0) { vx = (b[1] - a[1]) / dt; vy = (b[2] - a[2]) / dt; } }
+    const sp = Math.hypot(vx, vy), cap = Math.min(1, 6000 / (sp || 1));
+    vx *= cap; vy *= cap;
+    const w = lastG.pillW * UI.size, h = lastG.pillH * UI.size;
+    const px = d.tx + vx * 0.22, py = d.ty + vy * 0.22;
+    const ne = nearestEdge(px, py, w, h), wa = ne.wa;
+    if (ne.dist < 32 || (sp > 350 && ne.dist < 160)) {
+      const along = ne.side === 'left' || ne.side === 'right' ? (clamp(py, wa.y0, wa.y1) + h / 2 - wa.y0) / (wa.y1 - wa.y0) : (clamp(px, wa.x0, wa.x1) + w / 2 - wa.x0) / (wa.x1 - wa.x0);
+      UI.dock = { side: ne.side, along: clamp(along) };
+    } else {
+      UI.dock = { side: null }; UI.floatAt = { x: px, y: py };
+    }
+    UI.pos.x.v = vx * 0.4; UI.pos.y.v = vy * 0.4;
+  }
+  hit.addEventListener('pointerup', endDrag);
+  hit.addEventListener('pointercancel', endDrag);
+
+  // -------------------------------------------------------------- main loop
+  let last = performance.now(), devClock = 0;
+  function frame(now) {
+    const realDt = Math.min(0.05, (now - last) / 1000); last = now;
+    const dt = realDt * (UI.slow ? 0.25 : 1);
+
+    // Simulation time
+    if (SIM.speed > 0) simulate(realDt * SIM.speed);
+    devClock += realDt;
+    if (SIM.devWalk && devClock > 1.6) {
+      devClock = 0;
+      SIM.cpu = clamp(SIM.cpu + (Math.random() - 0.5) * 22 + (20 - SIM.cpu) * 0.12, 2, 100);
+      SIM.ram = clamp(SIM.ram + (Math.random() - 0.5) * 4, 10, 98);
+    }
+    step(DEV.cpu, SIM.cpu, TWEEN, dt); step(DEV.ram, SIM.ram, TWEEN, dt);
+    for (const k in DEFS) {
+      const r = READ[k], sh = SHOW[k];
+      if (r && r.valid) { step(sh.pct, r.used, TWEEN, dt); step(sh.pace, r.pace, TWEEN, dt); }
+      else { step(sh.pct, 0, TWEEN, dt); }
+      sh.flash = Math.max(0, sh.flash - dt / 0.9);
+    }
+
+    // Widget motion
+    const g = lastG || geometry(0, UI.device, activeKeys().length);
+    const lingering = !UI.hovered && now - UI.leftAt < 300;
+    const want = !UI.dragging && (UI.pin || UI.hovered || lingering) ? 1 : 0;
+    step(UI.expand, want, want ? HOVER_IN : HOVER_OUT, dt);
+    step(UI.stacked, UI.dock.side === 'left' || UI.dock.side === 'right' ? 1 : 0, MORPH, dt);
+    step(UI.lift, UI.dragging ? 1.06 : 1, LIFT, dt);
+    const wa = work(), side = UI.dock.side;
+    const cxs = UI.pos.x.x + g.pillW * UI.size / 2, cys = UI.pos.y.x + g.pillH * UI.size / 2;
+    const axT = side === 'right' ? 1 : side === 'left' ? 0 : (cxs > (wa.x0 + wa.x1) / 2 ? 1 : 0);
+    const ayT = side === 'bottom' ? 1 : side === 'top' ? 0 : (cys > (wa.y0 + wa.y1) / 2 ? 1 : 0);
+    if (UI.expand.x < 0.02) { UI.ax.x = axT; UI.ay.x = ayT; }
+    step(UI.ax, axT, MORPH, dt); step(UI.ay, ayT, MORPH, dt);
+    if (UI.dragging && UI.drag && UI.drag.tx != null) {
+      step(UI.pos.x, UI.drag.tx, FOLLOW, dt); step(UI.pos.y, UI.drag.ty, FOLLOW, dt);
+    } else {
+      const [tx, ty] = dockTarget(g);
+      step(UI.pos.x, tx, SNAP, dt); step(UI.pos.y, ty, SNAP, dt);
+    }
+
+    lastG = render();
+    hud(now);
+    requestAnimationFrame(frame);
+  }
+
+  // ------------------------------------------------------------------ status
+  let hudAt = 0, galleryAt = 0;
+  function hud(now) {
+    if (now - hudAt < 150) return; hudAt = now;
+    if (now - galleryAt > 1500) { galleryAt = now; refreshGallery(); }
+    const day = Math.floor(SIM.t / DAY), sec = ((SIM.t % DAY) + DAY) % DAY;
+    const hh = Math.floor(sec / H), mm = Math.floor(sec % H / 60);
+    $('#clock').innerHTML = `${String((hh + 9) % 24).padStart(2, '0')}:${String(mm).padStart(2, '0')}<br>day ${day + 1}`;
+    const e = UI.scrub ? UI.scrubE : clamp(UI.expand.x);
+    const conn = { live: 'live', failing: isStale() ? 'failing, stale' : 'failing, keeping last reading', signedout: 'signed out' }[SIM.conn];
+    $('#statusline').textContent = `${UI.dock.side ? 'Docked to the ' + UI.dock.side + ' edge' : 'Floating'} · morph ${e.toFixed(2)} · next poll in ${fmtLeft(SIM.poll - (SIM.t - SIM.lastPoll))} · ${conn}`;
+    if (!UI.scrub) { $('#morph').value = e; $('#o-morph').textContent = e.toFixed(2); }
+    syncSliders();
+  }
+
+  // ---------------------------------------------------------------- controls
+  function seg(el, options, get, set) {
+    el.innerHTML = options.map(([v, l]) => `<button type="button" data-v="${v}">${l}</button>`).join('');
+    const sync = () => el.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === String(get()))));
+    el.addEventListener('click', ev => { const b = ev.target.closest('button'); if (!b) return; set(b.dataset.v); sync(); });
+    sync(); return sync;
+  }
+  seg($('#speed'), [['0', 'Paused'], ['1', 'Real time'], ['60', '1 min/s'], ['600', '10 min/s'], ['3600', '1 h/s']], () => SIM.speed, v => { SIM.speed = +v; });
+  seg($('#poll'), [['60', '1 min'], ['300', '5 min'], ['900', '15 min'], ['3600', '1 hour']], () => SIM.poll, v => { SIM.poll = +v; });
+  seg($('#activity'), [['idle', 'Idle'], ['steady', 'Steady'], ['heavy', 'Heavy']], () => SIM.activity, v => { SIM.activity = v; });
+  seg($('#conn'), [['live', 'Live'], ['failing', 'Requests failing'], ['signedout', 'Signed out']], () => SIM.conn, v => { SIM.conn = v; poll(); });
+  seg($('#wall'), [['photo', 'Photo'], ['busy', 'Busy'], ['light', 'Light'], ['dark', 'Dark']], () => $('#monitor').className.split('w-')[1], v => { $('#monitor').className = 'monitor w-' + v; });
+
+  const SCEN = {
+    'Calm':       { s5: [32, 40], w7: [58, 65], fb: [38, 41] },
+    'Burning':    { s5: [71, 45], w7: [74, 60], fb: [52, 41] },
+    'Near limit': { s5: [94, 80], w7: [96, 86], fb: [91, 70] },
+    'Just reset': { s5: [1, 1],   w7: [2, 1],   fb: [1, 1] },
+  };
+  let scen = 'Calm';
+  const syncScen = seg($('#scenario'), Object.keys(SCEN).map(k => [k, k]), () => scen, v => {
+    scen = v;
+    for (const k in SCEN[v]) { const [u, pc] = SCEN[v][k]; SIM.win[k].used = u; SIM.win[k].start = SIM.t - pc / 100 * DEFS[k].len; }
+    poll();
+  });
+
+  // ------------------------------------------------------------ theme panel
+  // A static, fully expanded card in a given palette, for the gallery.
+  function miniCard(p, keys) {
+    const rows = [...keys.map(k => ({ k })), { dev: 'CPU', v: DEV.cpu.x }, { dev: 'RAM', v: DEV.ram.x }];
+    const step = 26, H = 14 + rows.length * step;
+    let s = `<svg viewBox="0 0 316 ${H}" aria-hidden="true"><rect width="316" height="${H}" fill="${p.bg}"/>`;
+    rows.forEach((r, i) => {
+      const y = 22 + i * step, x0 = 70, x1 = 236, len = x1 - x0;
+      let label, fig, col, track = `<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="${p.track}" stroke-width="8" stroke-linecap="round"/>`, fill = '', figCol = p.ink, labCol;
+      if (r.k) {
+        const pct = clamp(SHOW[r.k].pct.x, 0, 100), pace = clamp(SHOW[r.k].pace.x, 0, 100), st = stateOf(pct - pace);
+        const hue = p[r.k], sc = st === 'calm' || p.noState ? hue : p[st];
+        label = DEFS[r.k].label; labCol = hue; fig = `${Math.round(pct)}%`;
+        if (st !== 'calm' && !p.noState) figCol = sc;
+        if (st === 'calm' || pct <= pace) fill = `<line x1="${x0}" y1="${y}" x2="${x0 + len * pct / 100}" y2="${y}" stroke="${sc}" stroke-width="8" stroke-linecap="round"/>`;
+        else fill = `<line x1="${x0}" y1="${y}" x2="${x0 + len * pace / 100}" y2="${y}" stroke="${hue}" stroke-width="8" stroke-linecap="round"/>`
+          + `<line x1="${x0 + len * pace / 100}" y1="${y}" x2="${x0 + len * pct / 100}" y2="${y}" stroke="${sc}" stroke-width="8" stroke-linecap="round"/>`
+          + `<line x1="${x0 + len * pace / 100}" y1="${y}" x2="${x0 + len * pct / 100}" y2="${y}" stroke="url(#hatch)" stroke-width="8"/>`;
+        fill += `<line x1="${x0 + len * pace / 100}" y1="${y - 8}" x2="${x0 + len * pace / 100}" y2="${y + 8}" stroke="${p.tick}" stroke-width="3" stroke-linecap="round"/>`;
+      } else {
+        label = r.dev; labCol = p.muted; fig = `${Math.round(r.v)}%`;
+        fill = `<line x1="${x0}" y1="${y}" x2="${x0 + len * clamp(r.v, 0, 100) / 100}" y2="${y}" stroke="${loadColor(p, r.v, r.dev === 'RAM' ? p.ram : p.dev)}" stroke-width="8" stroke-linecap="round"/>`;
+      }
+      s += `<text x="16" y="${y + 6}" font-size="17" font-weight="600" fill="${labCol}" font-family="Segoe UI, sans-serif">${label}</text>${track}${fill}`
+         + `<text x="300" y="${y + 6}" font-size="18" font-weight="600" fill="${figCol}" text-anchor="end" font-family="Segoe UI, sans-serif">${fig}</text>`;
+    });
+    return s + '</svg>';
+  }
+
+  function buildTheme() {
+    $('#gallery').innerHTML = PRESETS.map(pr => `<button type="button" class="gcard" data-preset="${pr.id}"><span class="gsvg"></span><span class="gname">${pr.name}<small>${pr.note}</small></span></button>`).join('');
+    $('#gallery').addEventListener('click', ev => {
+      const b = ev.target.closest('[data-preset]'); if (!b) return;
+      const pr = presetById(b.dataset.preset);
+      THEME.base = pr.id;
+      THEME.roles = { ...(pr.id === 'system' ? resolvedRoles() : pr) };
+      THEME.accents = pr.accents || 'hues';
+      syncTheme();
+    });
+    $('#roles').innerHTML = ROLES.map(([k, l]) => `<label class="role" data-role="${k}"><input type="color" data-k="${k}"><span>${l}<br><code></code></span></label>`).join('');
+    $('#roles').addEventListener('input', ev => {
+      const k = ev.target.dataset.k; if (!k) return;
+      if (THEME.base === 'system') THEME.roles = { ...resolvedRoles() };
+      THEME.roles[k] = ev.target.value; THEME.base = 'custom';
+      syncTheme();
+    });
+    const accSync = seg($('#accents'), [['hues', 'Own colour each'], ['shades', 'One colour, shaded'], ['mono', 'Monochrome']], () => THEME.accents, v => { THEME.accents = v; syncTheme(); });
+    seg($('#states'), [['theme', 'Theme'], ['cvd', 'Colour-blind safe'], ['none', 'Hatching only']], () => THEME.states, v => { THEME.states = v; syncTheme(); });
+    seg($('#material'), [['solid', 'Solid'], ['glass', 'Glass'], ['float', 'Floating rings']], () => THEME.material, v => { THEME.material = v; syncTheme(); });
+    THEME.syncAccents = accSync;
+    $('#copyTheme').addEventListener('click', async () => {
+      const r = resolvedRoles();
+      const json = JSON.stringify({ appearance: {
+        theme: THEME.base === 'custom' ? 'custom' : THEME.base,
+        colors: { background: r.bg, text: r.ink, session: r.s5, weekly: r.w7, fable: r.fb, cpu: r.dev, ram: r.ram || pal().ram, over_pace: r.warm, far_over: r.hot },
+        window_colours: THEME.accents, warning_colours: THEME.states, material: THEME.material,
+        widget_size: Math.round(UI.size * 100),
+      } }, null, 2);
+      try { await navigator.clipboard.writeText(json); $('#copied').textContent = 'Copied.'; }
+      catch { console.log(json); $('#copied').textContent = 'Clipboard blocked; printed to the console.'; }
+      setTimeout(() => { $('#copied').textContent = ''; }, 2500);
+    });
+    try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', syncTheme); } catch {}
+    syncTheme();
+  }
+
+  function syncTheme() {
+    const r = resolvedRoles(), keys = activeKeys(), p = pal();
+    const pr = presetById(THEME.base);
+    $('#themeName').textContent = pr ? pr.name : 'Custom';
+    document.querySelectorAll('.gcard').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.preset === THEME.base)));
+    document.querySelectorAll('#roles [data-role]').forEach(el => {
+      const k = el.dataset.role, inp = el.querySelector('input');
+      const val = r[k] || p[k]; inp.value = val.toLowerCase(); el.querySelector('code').textContent = val.toUpperCase();
+      // Roles a mode does not use are shown dimmed rather than hidden.
+      const unused = (k === 's5' && !SIM.has5h) || (k === 'fb' && !SIM.hasFable)
+        || (THEME.accents === 'mono' && ['s5', 'w7', 'fb', 'dev', 'ram'].includes(k))
+        || (THEME.accents === 'shades' && ['s5', 'fb'].includes(k))
+        || (THEME.states !== 'theme' && ['warm', 'hot'].includes(k));
+      el.classList.toggle('off', unused);
+    });
+    if (THEME.syncAccents) THEME.syncAccents();
+    $('#materialNote').textContent = {
+      solid: 'An opaque panel, as today.',
+      glass: 'Translucent over a blur of what is behind it. In the app this needs an undocumented Windows call for layered windows, so treat it as a maybe.',
+      float: 'Collapsed, the rings sit straight on the desktop with no disc; the panel appears only when the card opens.',
+    }[THEME.material];
+    // Contrast table
+    const check = (name, fg, need) => { const c = contrast(fg, p.bg); return `<tr><td>${name}</td><td>${c.toFixed(1)}:1</td><td class="${c >= need ? 'ok' : 'bad'}">${c >= need ? 'pass' : 'below ' + need}</td></tr>`; };
+    let rows = check('Text', p.ink, 4.5) + check('Muted text', p.muted, 4.5);
+    keys.forEach(k => { rows += check(`${DEFS[k].label} label`, p[k], 4.5); });
+    rows += check('CPU bar', p.dev, 3) + check('RAM bar', p.ram, 3);
+    if (!p.noState) rows += check('Over pace', p.warm, 3) + check('Far over', p.hot, 3);
+    rows += check('Track', p.track, 1.3).replace('below 1.3', 'too faint');
+    // A window colour too close to a warning colour hides the warning.
+    const dist0 = (a, b) => { const A = hexRgb(a), B = hexRgb(b); return Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2]); };
+    if (dist0(p.dev, p.ram) < 60) rows += `<tr><td>CPU vs RAM</td><td></td><td class="bad">too alike</td></tr>`;
+    if (!p.noState) {
+      const dist = (a, b) => { const A = hexRgb(a), B = hexRgb(b); return Math.hypot(A[0] - B[0], A[1] - B[1], A[2] - B[2]); };
+      keys.forEach(k => [['warm', 'over pace'], ['hot', 'far over']].forEach(([s, n]) => {
+        if (dist(p[k], p[s]) < 80) rows += `<tr><td>${DEFS[k].label} vs ${n}</td><td></td><td class="bad">too alike</td></tr>`;
+      }));
+    }
+    $('#contrast').innerHTML = rows;
+    $('#monitor').dataset.dark = p.dark;
+    refreshGallery();
+    buildWindowSwatches();
+  }
+  function refreshGallery() {
+    const keys = activeKeys();
+    document.querySelectorAll('.gcard').forEach(b => {
+      const pr = presetById(b.dataset.preset);
+      const roles = pr.id === 'system' ? presetById(systemDark() ? 'graphite' : 'paper') : pr;
+      b.querySelector('.gsvg').innerHTML = miniCard(palFor(roles, pr.accents || 'hues', THEME.states, keys), keys);
+    });
+  }
+  function buildWindowSwatches() {
+    const p = pal();
+    document.querySelectorAll('[data-group]').forEach(g => { const sw = g.querySelector('.swatch'); if (sw) sw.style.background = p[g.dataset.group]; });
+  }
+
+  function buildWindows() {
+    const p = pal();
+    $('#windows').innerHTML = ['s5', 'w7', 'fb'].map(k => `
+      <div class="group" data-group="${k}">
+        <div class="group-title"><span class="swatch" style="background:${p[k]}"></span>${DEFS[k].label} window</div>
+        <div class="pair">
+          <div class="field"><span>Used <output id="o-${k}-u"></output></span><input type="range" min="0" max="100" step="0.5" data-k="${k}" data-f="u"></div>
+          <div class="field"><span>Time gone <output id="o-${k}-p"></output></span><input type="range" min="0" max="99.5" step="0.5" data-k="${k}" data-f="p"></div>
+        </div>
+      </div>`).join('');
+    $('#windows').addEventListener('input', ev => {
+      const el = ev.target, k = el.dataset.k; if (!k) return;
+      if (el.dataset.f === 'u') SIM.win[k].used = +el.value;
+      else SIM.win[k].start = SIM.t - (+el.value) / 100 * DEFS[k].len;
+      scen = null; syncScen(); poll();
+    });
+  }
+  let activeSlider = null;
+  document.addEventListener('pointerdown', e => { if (e.target.matches('input[type=range]')) activeSlider = e.target; });
+  document.addEventListener('pointerup', () => { activeSlider = null; });
+  function syncSliders() {
+    document.querySelectorAll('[data-group]').forEach(gEl => { const k = gEl.dataset.group; gEl.style.display = activeKeys().includes(k) ? '' : 'none'; });
+    document.querySelectorAll('#windows input').forEach(el => {
+      const k = el.dataset.k, v = el.dataset.f === 'u' ? SIM.win[k].used : paceOf(k);
+      if (el !== activeSlider) el.value = v;
+      $(`#o-${k}-${el.dataset.f}`).textContent = el.dataset.f === 'u' ? `${Math.round(v)}%` : `${Math.round(v)}% · ${fmtLeft(remainingOf(k))} left`;
+    });
+    for (const id of ['cpu', 'ram']) { if ($('#' + id) !== activeSlider) $('#' + id).value = SIM[id]; $('#o-' + id).textContent = Math.round(SIM[id]) + '%'; }
+  }
+  $('#cpu').addEventListener('input', e => { SIM.cpu = +e.target.value; });
+  $('#ram').addEventListener('input', e => { SIM.ram = +e.target.value; });
+  $('#devWalk').addEventListener('change', e => { SIM.devWalk = e.target.checked; });
+  $('#has5h').addEventListener('change', e => { SIM.has5h = e.target.checked; poll(); syncTheme(); });
+  $('#hasFable').addEventListener('change', e => { SIM.hasFable = e.target.checked; poll(); syncTheme(); });
+  $('#device').addEventListener('change', e => { UI.device = e.target.checked; });
+  $('#pin').addEventListener('change', e => { UI.pin = e.target.checked; });
+  $('#slow').addEventListener('change', e => { UI.slow = e.target.checked; });
+  $('#scrub').addEventListener('change', e => { UI.scrub = e.target.checked; $('#morph').disabled = !UI.scrub; UI.scrubE = +$('#morph').value; });
+  $('#morph').addEventListener('input', e => { UI.scrubE = +e.target.value; $('#o-morph').textContent = UI.scrubE.toFixed(2); });
+  $('#size').addEventListener('input', e => { UI.size = +e.target.value / 100; $('#o-size').textContent = e.target.value + '%'; });
+  $('#pollNow').addEventListener('click', poll);
+  $('#resetPos').addEventListener('click', () => { UI.dock = { side: 'bottom', along: 0.78 }; });
+
+  // ------------------------------------------------------------------- start
+  buildWindows();
+  buildTheme();
+  poll();
+  lastG = geometry(0, UI.device, activeKeys().length);
+  const [x0, y0] = dockTarget(lastG); UI.pos.x.x = x0; UI.pos.y.x = y0;
+  syncSliders();
+  requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+</body>
+</html>
