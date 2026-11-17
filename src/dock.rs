@@ -289,7 +289,9 @@ const SNAP: SpringCfg = SpringCfg::new(0.45, 0.3);
 const MORPH: SpringCfg = SpringCfg::new(0.4, 0.12);
 /// Picked up and set down.
 const LIFT: SpringCfg = SpringCfg::new(0.25, 0.35);
-const HOVER_IN: SpringCfg = SpringCfg::new(0.34, 0.15);
+/// No bounce: the card lands on its size and stays there. A bounce here read as
+/// the widget jiggling under the cursor.
+const HOVER_IN: SpringCfg = SpringCfg::new(0.34, 0.0);
 const HOVER_OUT: SpringCfg = SpringCfg::new(0.28, 0.0);
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -461,6 +463,28 @@ pub struct Frame {
     pub docked: bool,
     /// Something is still moving, so another frame is needed soon.
     pub moving: bool,
+}
+
+impl Frame {
+    /// The window in whole screen pixels, as `(left, top, width, height)`.
+    ///
+    /// Each edge is rounded on its own, rather than the origin and the size
+    /// separately. The widget grows away from the edge it docks on, so that
+    /// edge (and the pill drawn against it) stays put while the expansion
+    /// runs; rounding the left and the width apart moved it by up to two
+    /// pixels from frame to frame, which made the hover jiggle.
+    pub fn pixel_rect(&self) -> (i32, i32, i32, i32) {
+        let left = self.left.round();
+        let top = self.top.round();
+        let right = (self.left + self.width).round().max(left + 1.0);
+        let bottom = (self.top + self.height).round().max(top + 1.0);
+        (
+            left as i32,
+            top as i32,
+            (right - left) as i32,
+            (bottom - top) as i32,
+        )
+    }
 }
 
 pub struct Motion {
@@ -711,7 +735,7 @@ impl Motion {
         self.expand.step(hover_to, hover_cfg, dt);
 
         let t = self.stacked.x.clamp(0.0, 1.0);
-        let e = self.expand.x.clamp(0.0, 1.04);
+        let e = self.expand.x.clamp(0.0, 1.0);
         let a = self.hover.x.clamp(0.0, 1.0);
         let mirror = docked && self.side == Side::Right;
         let lifted = scale * (1.0 + LIFT_GROWTH * self.lift.x);
@@ -972,5 +996,52 @@ mod tests {
         assert!(f.mirror && f.expanded > 0.99);
         assert!((f.width - CARD_W).abs() < 0.5);
         assert!((f.left + f.width - 1920.0).abs() < 0.5);
+    }
+
+    /// Ticks a widget docked on `side` of a 1920x1080 monitor at a fractional
+    /// scale, hovers it, and returns every frame of the expansion.
+    fn hover_frames(anchor: [f64; 2]) -> Vec<Frame> {
+        let monitors = [rect(0.0, 0.0, 1920.0, 1080.0)];
+        let mut m = Motion::new(anchor);
+        let mut now = 0.0;
+        for _ in 0..200 {
+            now += 0.016;
+            m.tick(now, 0.016, &monitors, 1.25, 1.25);
+        }
+        m.set_hovered(true, now);
+        let mut frames = Vec::new();
+        for _ in 0..60 {
+            now += 0.0161;
+            frames.push(m.tick(now, 0.0161, &monitors, 1.25, 1.25).unwrap());
+        }
+        frames
+    }
+
+    #[test]
+    fn the_docked_edge_holds_still_in_pixels_while_the_card_grows() {
+        let right = hover_frames([1900.0, 300.0]);
+        assert_eq!(right[0].side, Side::Right);
+        let edge = |f: &Frame| {
+            let (l, _, w, _) = f.pixel_rect();
+            l + w
+        };
+        assert!(right.iter().all(|f| edge(f) == edge(&right[0])));
+        assert!(right.iter().all(|f| f.pixel_rect().1 == right[0].pixel_rect().1));
+
+        let bottom = hover_frames([900.0, 1070.0]);
+        assert_eq!(bottom[0].side, Side::Bottom);
+        let floor = |f: &Frame| {
+            let (_, t, _, h) = f.pixel_rect();
+            t + h
+        };
+        assert!(bottom.iter().all(|f| floor(f) == floor(&bottom[0])));
+    }
+
+    #[test]
+    fn the_card_never_grows_past_its_size() {
+        for f in hover_frames([1900.0, 300.0]) {
+            assert!(f.expanded <= 1.0);
+            assert!(f.width <= CARD_W * 1.25 + 1e-9);
+        }
     }
 }
