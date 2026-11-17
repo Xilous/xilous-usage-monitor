@@ -354,15 +354,15 @@ pub struct Card {
     pub device_y: [f64; 2],
 }
 
-pub const CARD_W: f64 = 316.0;
+pub const CARD_W: f64 = 340.0;
 /// Columns of a card row, from its left edge: the label, the bar, the
-/// percentage (right-aligned at FIGURE_R) and the reset time (right-aligned
+/// percentage over its pace (right-aligned at FIGURE_R) and the reset time (right-aligned
 /// at RESET_R).
 pub const LABEL_X: f64 = 14.0;
 pub const BAR_X0: f64 = 54.0;
-pub const BAR_X1: f64 = 194.0;
-pub const FIGURE_R: f64 = 240.0;
-pub const RESET_R: f64 = 302.0;
+pub const BAR_X1: f64 = 176.0;
+pub const FIGURE_R: f64 = 270.0;
+pub const RESET_R: f64 = 326.0;
 pub const CARD_RADIUS: f64 = 8.0;
 const ROW_TOP: f64 = 23.0;
 const ROW_STEP: f64 = 24.0;
