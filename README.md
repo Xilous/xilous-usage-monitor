@@ -11,7 +11,9 @@ bar, one row per ring:
 
 - **Usage** (left cluster, top rows): the 5h window on the outer ring, the 7d
   window inside it, and the model-specific **Fable** quota innermost, each
-  with its **percentage used** and reset countdown. A tick across each ring,
+  with its **percentage used** and reset countdown. Expanded, the 7d and
+  Fable figures read as usage over pace, `58% / 65%`, the denominator being
+  where an even spend would have put the window by now. A tick across each ring,
   and a notch across each bar, marks where an even spend would have put you.
   A window that runs 8 points ahead of that pace turns the over-pace colour,
   and 18 points ahead the far-over colour, however low or high its
@@ -100,7 +102,7 @@ side. **Hover** it and it grows into the card of pace bars, away from the edge
 it sits on; it collapses again a moment after the cursor leaves.
 
 At the default 100% widget size, the collapsed widget is 136 by 62 logical
-pixels (62 by 136 stacked) and the card 316 wide: 121 tall with two usage
+pixels (62 by 136 stacked) and the card 340 wide: 121 tall with two usage
 windows, 145 with three. The **Widget size** slider
 scales those from 75% to 200%, on top of monitor DPI scaling. Dark and light
 system themes are supported. Ambient animation runs at 10 Hz and motion at the

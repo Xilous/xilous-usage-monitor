@@ -2926,6 +2926,9 @@ struct UsageRow<'a> {
     state: Color,
     warned: bool,
     figure: String,
+    /// ` / 65%`: the pace, the percentage an even spend would have reached by
+    /// now, after the 7d and Fable figures, so each reads as usage over pace.
+    denominator: Option<String>,
     reset: &'a str,
     severity: u8,
 }
@@ -3042,6 +3045,7 @@ fn compose_docked(
                 state,
                 warned,
                 figure: readout::figure(pct, texts[slot]),
+                denominator: pace.filter(|_| slot != 0).map(|q| format!(" / {:.0}%", q)),
                 reset: if stale && reading {
                     "Stale"
                 } else {
@@ -3073,6 +3077,7 @@ fn compose_docked(
     };
 
     // ---- GDI layer: the panel colour, hairlines and row text ----------------
+    let denominator_w: Vec<i32>;
     unsafe {
         fill_box(hdc, 0, 0, width, height, &p.bg);
         let _ = SetBkMode(hdc, TRANSPARENT);
@@ -3129,7 +3134,14 @@ fn compose_docked(
         let label_font = font(11.0, FW_SEMIBOLD);
         let figure_font = font(13.0, FW_SEMIBOLD);
         let reset_font = font(11.0, FW_NORMAL);
-        let old_font = SelectObject(hdc, label_font);
+        let old_font = SelectObject(hdc, figure_font);
+        // How far each usage figure sits left of the column's edge, to make room
+        // for its denominator; the travelling headline figure lands there too.
+        denominator_w = rows
+            .iter()
+            .map(|r| r.denominator.as_deref().map_or(0, |d| text_width(hdc, d)))
+            .collect();
+        SelectObject(hdc, label_font);
         let row_rect = |left: f64, right: f64, y: f64| RECT {
             left: px(left),
             top: px(y - 9.0),
@@ -3143,6 +3155,7 @@ fn compose_docked(
                         figure: &str,
                         fig_c: Color,
                         reset: Option<&str>,
+                        denominator: Option<&str>,
                         skip_figure: bool| {
             let ta = text_alpha(i);
             if ta <= 0.01 {
@@ -3157,11 +3170,22 @@ fn compose_docked(
                 &blend(p.bg, label_c, ta),
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            if !skip_figure {
-                SelectObject(hdc, figure_font);
+            SelectObject(hdc, figure_font);
+            let mut figure_rect = row_rect(cx(dock::BAR_X1), cx(dock::FIGURE_R) + slide, y);
+            if let Some(den) = denominator {
                 draw_text_in(
                     hdc,
-                    row_rect(cx(dock::BAR_X1), cx(dock::FIGURE_R) + slide, y),
+                    figure_rect,
+                    den,
+                    &blend(p.bg, p.muted, ta),
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                figure_rect.right -= text_width(hdc, den);
+            }
+            if !skip_figure {
+                draw_text_in(
+                    hdc,
+                    figure_rect,
                     figure,
                     &blend(p.bg, fig_c, ta),
                     DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
@@ -3189,6 +3213,7 @@ fn compose_docked(
                 &r.figure,
                 figure_ink(r),
                 Some(r.reset),
+                r.denominator.as_deref(),
                 travelling,
             );
         }
@@ -3203,6 +3228,7 @@ fn compose_docked(
                 p.muted,
                 &format!("{:.0}%", value.clamp(0.0, 100.0)),
                 p.ink,
+                None,
                 None,
                 false,
             );
@@ -3306,7 +3332,7 @@ fn compose_docked(
             let (mask, mw, mh) = text_coverage(hdc, &r.figure, -(size * s).round() as i32, weight);
             // Centred in the rings collapsed, right-aligned in its row open.
             let from_x = usage_c.0 * s - mw as f64 / 2.0;
-            let to_x = cx(dock::FIGURE_R) * s - mw as f64;
+            let to_x = (cx(dock::FIGURE_R) * s).round() - denominator_w[i] as f64 - mw as f64;
             let mid_y = (usage_c.1 + (cy(card.usage_y[i]) - usage_c.1) * ei) * s;
             let x = (from_x + (to_x - from_x) * ei).round() as i32;
             let y = (mid_y - mh as f64 / 2.0).round() as i32;
