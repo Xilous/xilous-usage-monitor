@@ -2613,8 +2613,8 @@ fn render_docked(hwnd: HWND) {
         poll_interval_ms,
     );
 
-    let width = (frame.width.ceil() as i32).max(1);
-    let height = (frame.height.ceil() as i32).max(1);
+    // Edges rounded one by one, so the docked edge never moves (Frame::pixel_rect).
+    let (win_x, win_y, width, height) = frame.pixel_rect();
     unsafe {
         let screen_dc = GetDC(hwnd);
         let bmi = BITMAPINFO {
@@ -2653,8 +2653,8 @@ fn render_docked(hwnd: HWND) {
         );
 
         let dst = POINT {
-            x: frame.left.round() as i32,
-            y: frame.top.round() as i32,
+            x: win_x,
+            y: win_y,
         };
         let size = SIZE {
             cx: width,
@@ -5972,7 +5972,7 @@ pub fn write_docked_preview(
         text_tick: 0.0,
         poll_frac: 0.5,
     };
-    let (w, h) = (frame.width.ceil() as i32, frame.height.ceil() as i32);
+    let (_, _, w, h) = frame.pixel_rect();
     let widget: Vec<u32> = unsafe {
         let dc = CreateCompatibleDC(None);
         let info = BITMAPINFO {
