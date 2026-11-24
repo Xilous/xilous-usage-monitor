@@ -2442,8 +2442,11 @@ fn default_dock_anchor() -> [f64; 2] {
             return [0.0, 0.0];
         }
         let m = info.rcMonitor;
+        // A pixel inside the primary: its right edge may be the seam with a
+        // monitor to its right, and a point on the seam itself is as near to
+        // that monitor's left edge.
         [
-            m.right as f64,
+            (m.right - 1) as f64,
             m.top as f64 + (m.bottom - m.top) as f64 / 3.0,
         ]
     }

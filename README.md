@@ -95,8 +95,8 @@ support Tab and Space, and the slider also takes the arrow keys and
 PageUp/PageDown. Customization applies to the widget, not the Windows shell's
 notification-area icon badges.
 
-The widget is collapsed to a pill of rings and docked on an outer edge of your
-desktop, floating above normal application windows. On the left or right edge
+The widget is collapsed to a pill of rings and docked on a screen edge,
+floating above normal application windows. On the left or right edge
 the usage and device rings stack; on the top or bottom edge they sit side by
 side. **Hover** it and it grows into the card of pace bars, away from the edge
 it sits on; it collapses again a moment after the cursor leaves.
@@ -109,14 +109,17 @@ system themes are supported. Ambient animation runs at 10 Hz and motion at the
 fastest timer rate while something moves; CPU and RAM sampling runs at 2
 seconds. None of it causes additional network polls.
 
-**Drag** the widget anywhere, across monitors too. Near an outer edge a magnet
-pulls it in, and close enough it snaps on and slides along the edge; pull it
-away to free it. Let go and it carries the throw onto the nearest outer edge.
-Edges shared by two monitors don't count, so it never docks in the middle of
-the desktop. It remembers its edge across restarts; a position saved by an
-older version docks to the nearest edge. On a fresh start it docks on the right
-edge of the primary display, a third of the way down. Removed monitors or a
-changed display layout move it to the nearest outer edge.
+**Drag** the widget anywhere, across monitors too. Near an edge a magnet pulls
+it in, and close enough it snaps on and slides along the edge; pull it away to
+free it. Let go and it carries the throw onto the nearest edge. With more than
+one monitor, the seam between two of them counts as an edge too: the widget
+docks flush against the seam on whichever side you drop it, stays on that
+monitor, and grows away from the seam when hovered. Dragging across a seam
+catches on it briefly before letting go onto the other monitor. It remembers
+its edge across restarts; a position saved by an older version docks to the
+nearest edge. On a fresh start it docks on the right edge of the primary
+display, a third of the way down. Removed monitors or a changed display layout
+move it to the nearest edge.
 
 Right-click the widget or its tray icon for appearance, refresh, update
 frequency, settings, visibility, and **Reset Position** (returns it to the
