@@ -1,10 +1,11 @@
 //! Edge docking for the floating widget.
 //!
-//! The widget lives on an outer edge of the desktop. Dragged, it follows the
-//! cursor freely; near an outer edge a magnet leans it in, and inside the
-//! catch distance it snaps on and slides along that edge. Let go, it carries
-//! the throw's momentum onto the nearest outer edge. On the left or right edge
-//! the two ring pairs stack; on the top or bottom they sit side by side.
+//! The widget lives on a monitor edge: an outer edge of the desktop, or the
+//! seam between two monitors, flush against either side of it. Dragged, it
+//! follows the cursor freely; near an edge a magnet leans it in, and inside
+//! the catch distance it snaps on and slides along that edge. Let go, it
+//! carries the throw's momentum onto the nearest edge. On the left or right
+//! edge the two ring pairs stack; on the top or bottom they sit side by side.
 //! Hovered, it expands into a card of pace bars, growing away from its edge.
 //!
 //! This module is the geometry, the springs and the layouts only. It knows
@@ -79,8 +80,8 @@ impl Side {
     }
 }
 
-/// A stretch of outer edge the widget may sit on. `fixed` is the edge's
-/// coordinate across it, `from..to` its extent along it.
+/// A monitor edge the widget may sit on. `fixed` is the edge's coordinate
+/// across it, `from..to` its extent along it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Segment {
     pub side: Side,
@@ -90,64 +91,33 @@ pub struct Segment {
     pub monitor: usize,
 }
 
-/// The outer edges of the desktop: every monitor edge, minus wherever it
-/// touches another monitor, so the widget never docks in the middle of a
-/// multi-monitor desktop.
+/// Every edge of every monitor, whole. An edge two monitors share is the seam
+/// between them, and it is two edges, one on each monitor: the widget docks
+/// flush against the seam on whichever side it is dropped, staying on that
+/// monitor and growing away from the seam when hovered.
 pub fn edge_segments(monitors: &[Rect]) -> Vec<Segment> {
-    fn subtract(ranges: Vec<(f64, f64)>, a: f64, b: f64) -> Vec<(f64, f64)> {
-        let mut out = Vec::with_capacity(ranges.len() + 1);
-        for (from, to) in ranges {
-            if b <= from || a >= to {
-                out.push((from, to));
-                continue;
-            }
-            if a > from {
-                out.push((from, a));
-            }
-            if b < to {
-                out.push((b, to));
-            }
-        }
-        out
-    }
-
-    let mut segments = Vec::new();
-    for (i, m) in monitors.iter().enumerate() {
-        let sides = [
-            (Side::Left, m.left, m.top, m.bottom),
-            (Side::Right, m.right, m.top, m.bottom),
-            (Side::Top, m.top, m.left, m.right),
-            (Side::Bottom, m.bottom, m.left, m.right),
-        ];
-        for (side, fixed, from, to) in sides {
-            let mut ranges = vec![(from, to)];
-            for (j, n) in monitors.iter().enumerate() {
-                if j == i {
-                    continue;
-                }
-                let (touches, a, b) = match side {
-                    Side::Left => (n.right == m.left, n.top, n.bottom),
-                    Side::Right => (n.left == m.right, n.top, n.bottom),
-                    Side::Top => (n.bottom == m.top, n.left, n.right),
-                    Side::Bottom => (n.top == m.bottom, n.left, n.right),
-                };
-                if touches {
-                    ranges = subtract(ranges, a, b);
-                }
-            }
-            segments.extend(ranges.into_iter().map(|(from, to)| Segment {
+    monitors
+        .iter()
+        .enumerate()
+        .flat_map(|(i, m)| {
+            [
+                (Side::Left, m.left, m.top, m.bottom),
+                (Side::Right, m.right, m.top, m.bottom),
+                (Side::Top, m.top, m.left, m.right),
+                (Side::Bottom, m.bottom, m.left, m.right),
+            ]
+            .map(|(side, fixed, from, to)| Segment {
                 side,
                 fixed,
                 from,
                 to,
                 monitor: i,
-            }));
-        }
-    }
-    segments
+            })
+        })
+        .collect()
 }
 
-/// Where a collapsed widget would sit on an outer edge, and how far the
+/// Where a collapsed widget would sit on a monitor edge, and how far the
 /// widget being placed is from it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spot {
@@ -437,8 +407,11 @@ struct Press {
     at: [f64; 2],
     active: bool,
     caught: bool,
-    /// Where the free widget is headed this frame, magnet included.
-    free: Option<[f64; 2]>,
+    /// Where the widget is headed this frame: the spot it is caught on, or
+    /// the free point, magnet included. A release starts from here rather
+    /// than from the springs, which may still be bouncing past a seam onto
+    /// the other monitor's side.
+    aim: Option<[f64; 2]>,
     samples: Vec<(f64, [f64; 2])>,
 }
 
@@ -571,7 +544,7 @@ impl Motion {
             at: [cursor[0] - grab[0], cursor[1] - grab[1]],
             active: false,
             caught: false,
-            free: None,
+            aim: None,
             samples: vec![(now, cursor)],
         });
     }
@@ -604,11 +577,7 @@ impl Motion {
             return false;
         }
         let v = throw_velocity(&p.samples, now, MAX_THROW_SPEED * unit);
-        let from = if p.caught {
-            [self.x.x, self.y.x]
-        } else {
-            p.free.unwrap_or(p.at)
-        };
+        let from = p.aim.unwrap_or(p.at);
         self.anchor = [from[0] + v[0] * THROW_REACH, from[1] + v[1] * THROW_REACH];
         // The springs set off at the throw's speed, so the glide continues the
         // drag instead of starting from rest.
@@ -664,6 +633,7 @@ impl Motion {
                 match spot {
                     Some(spot) if spot.gap <= catch_at => {
                         p.caught = true;
+                        p.aim = Some(spot.center);
                         target = spot.center;
                         // Snapped on across the edge, sliding freely along it.
                         (cfg_x, cfg_y) = if spot.side.stacked() {
@@ -693,7 +663,7 @@ impl Motion {
                                 to = [to[0] + n[0] * pull, to[1] + n[1] * pull];
                             }
                         }
-                        p.free = Some(to);
+                        p.aim = Some(to);
                         target = to;
                         (cfg_x, cfg_y) = (FOLLOW, FOLLOW);
                         want_stacked = resting_orientation;
@@ -855,24 +825,78 @@ mod tests {
         assert_eq!(layout(1.0, 1.0, 3).h, three.h);
     }
 
-    #[test]
-    fn shared_monitor_edges_are_not_outer_edges() {
-        let monitors = [
-            rect(0.0, 0.0, 1920.0, 1080.0),
-            rect(1920.0, 0.0, 3840.0, 1080.0),
-        ];
-        let segments = edge_segments(&monitors);
-        assert!(!segments
-            .iter()
-            .any(|s| s.side == Side::Right && s.monitor == 0));
-        assert!(!segments
-            .iter()
-            .any(|s| s.side == Side::Left && s.monitor == 1));
-        assert_eq!(segments.len(), 6);
+    /// Two 1920x1080 monitors side by side, the seam at x = 1920.
+    const SIDE_BY_SIDE: [Rect; 2] = [
+        Rect {
+            left: 0.0,
+            top: 0.0,
+            right: 1920.0,
+            bottom: 1080.0,
+        },
+        Rect {
+            left: 1920.0,
+            top: 0.0,
+            right: 3840.0,
+            bottom: 1080.0,
+        },
+    ];
+
+    /// Ticks `m` for `n` frames of 16 ms and returns the last frame.
+    fn run(m: &mut Motion, now: &mut f64, n: usize, monitors: &[Rect]) -> Frame {
+        let mut frame = None;
+        for _ in 0..n {
+            *now += 0.016;
+            frame = m.tick(*now, 0.016, monitors, 1.0, 1.0);
+        }
+        frame.unwrap()
+    }
+
+    /// Drags `m` from `start` to `end` over half a second, holds it there,
+    /// and lets go without a throw.
+    fn drag_and_drop(
+        m: &mut Motion,
+        now: &mut f64,
+        start: [f64; 2],
+        end: [f64; 2],
+        monitors: &[Rect],
+    ) {
+        m.press(start, *now, 1.0);
+        for i in 1..=30 {
+            *now += 0.016;
+            let t = i as f64 / 30.0;
+            m.drag(
+                [mix(start[0], end[0], t), mix(start[1], end[1], t)],
+                *now,
+                1.0,
+            );
+            m.tick(*now, 0.016, monitors, 1.0, 1.0);
+        }
+        run(m, now, 10, monitors);
+        *now += 0.2;
+        assert!(m.release(*now, 1.0));
     }
 
     #[test]
-    fn a_partly_shared_edge_keeps_its_open_stretch() {
+    fn the_seam_between_monitors_is_an_edge_on_each_side() {
+        let segments = edge_segments(&SIDE_BY_SIDE);
+        assert_eq!(segments.len(), 8);
+        let seam = |side: Side, monitor: usize| {
+            segments
+                .iter()
+                .find(|s| s.side == side && s.monitor == monitor)
+                .copied()
+                .unwrap()
+        };
+        let left_of_seam = seam(Side::Right, 0);
+        let right_of_seam = seam(Side::Left, 1);
+        assert_eq!(left_of_seam.fixed, 1920.0);
+        assert_eq!(right_of_seam.fixed, 1920.0);
+        assert_eq!((left_of_seam.from, left_of_seam.to), (0.0, 1080.0));
+        assert_eq!((right_of_seam.from, right_of_seam.to), (0.0, 1080.0));
+    }
+
+    #[test]
+    fn a_partly_shared_edge_is_dockable_along_its_whole_length() {
         let monitors = [
             rect(0.0, 0.0, 1920.0, 1080.0),
             rect(1920.0, 400.0, 3840.0, 1480.0),
@@ -882,7 +906,79 @@ mod tests {
             .filter(|s| s.side == Side::Right && s.monitor == 0)
             .collect();
         assert_eq!(right.len(), 1);
-        assert_eq!((right[0].from, right[0].to), (0.0, 400.0));
+        assert_eq!((right[0].from, right[0].to), (0.0, 1080.0));
+    }
+
+    #[test]
+    fn the_nearest_spot_takes_the_side_of_the_seam_it_is_on() {
+        let segments = edge_segments(&SIDE_BY_SIDE);
+        let left = nearest_spot([1880.0, 500.0], &segments, size).unwrap();
+        assert_eq!((left.side, left.monitor), (Side::Right, 0));
+        assert_eq!(left.center, [1920.0 - 31.0, 500.0]);
+        let right = nearest_spot([1960.0, 500.0], &segments, size).unwrap();
+        assert_eq!((right.side, right.monitor), (Side::Left, 1));
+        assert_eq!(right.center, [1920.0 + 31.0, 500.0]);
+    }
+
+    #[test]
+    fn a_widget_dropped_on_the_seam_docks_there_and_grows_away_from_it() {
+        // Start on the far right edge of the right monitor.
+        let mut m = Motion::new([3830.0, 500.0]);
+        let mut now = 0.0;
+        let f = run(&mut m, &mut now, 200, &SIDE_BY_SIDE);
+        assert_eq!(f.side, Side::Right);
+        assert!((f.left + f.width - 3840.0).abs() < 0.5);
+
+        // Drop it just right of the seam: it docks on the right monitor's left
+        // edge, flush against the seam. The drag is fast enough that the snap
+        // spring is still bouncing past the seam when it lets go, so this also
+        // checks the drop goes by the caught spot, not the bouncing springs.
+        let start = [f.left + 31.0, f.top + 68.0];
+        drag_and_drop(&mut m, &mut now, start, [1975.0, 500.0], &SIDE_BY_SIDE);
+        let f = run(&mut m, &mut now, 200, &SIDE_BY_SIDE);
+        assert_eq!(f.side, Side::Left);
+        assert!(f.docked && !f.moving);
+        assert!((f.left - 1920.0).abs() < 0.5);
+        assert!((f.width - 62.0).abs() < 0.01);
+        // It stays there: the saved anchor resolves to the same side.
+        assert!(m.anchor()[0] > 1920.0);
+
+        // Hovered, the card grows into the right monitor, away from the seam.
+        m.set_hovered(true, now);
+        let f = run(&mut m, &mut now, 100, &SIDE_BY_SIDE);
+        assert!(!f.mirror && f.expanded > 0.99);
+        assert!((f.left - 1920.0).abs() < 0.5);
+        assert!((f.width - CARD_W).abs() < 0.5);
+
+        // Dropped just left of the seam, it docks on the left monitor's right
+        // edge instead, and its card grows back into the left monitor.
+        m.set_hovered(false, now);
+        let f = run(&mut m, &mut now, 100, &SIDE_BY_SIDE);
+        let start = [f.left + 31.0, f.top + 68.0];
+        drag_and_drop(&mut m, &mut now, start, [1865.0, 500.0], &SIDE_BY_SIDE);
+        let f = run(&mut m, &mut now, 200, &SIDE_BY_SIDE);
+        assert_eq!(f.side, Side::Right);
+        assert!((f.left + f.width - 1920.0).abs() < 0.5);
+        m.set_hovered(true, now);
+        let f = run(&mut m, &mut now, 100, &SIDE_BY_SIDE);
+        assert!(f.mirror && f.expanded > 0.99);
+        assert!((f.left + f.width - 1920.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_drag_still_crosses_the_seam_to_the_other_monitor() {
+        // Docked on the left monitor's left edge, dragged across the seam to
+        // near the right monitor's bottom edge and dropped there.
+        let mut m = Motion::new([10.0, 500.0]);
+        let mut now = 0.0;
+        let f = run(&mut m, &mut now, 200, &SIDE_BY_SIDE);
+        assert_eq!(f.side, Side::Left);
+        let start = [f.left + 31.0, f.top + 68.0];
+        drag_and_drop(&mut m, &mut now, start, [2880.0, 900.0], &SIDE_BY_SIDE);
+        let f = run(&mut m, &mut now, 200, &SIDE_BY_SIDE);
+        assert_eq!(f.side, Side::Bottom);
+        assert!(f.left > 1920.0 && f.left + f.width < 3840.0);
+        assert!((f.top + f.height - 1080.0).abs() < 0.5);
     }
 
     #[test]
@@ -956,7 +1052,7 @@ mod tests {
         let y = 1080.0 - 31.0 - CATCH_DISTANCE - 0.5;
         m.drag([800.0, y], 0.1, 1.0);
         m.tick(0.1, 0.016, &monitors, 1.0, 1.0);
-        let pulled = m.press.as_ref().unwrap().free.unwrap();
+        let pulled = m.press.as_ref().unwrap().aim.unwrap();
         assert!((pulled[1] + 31.0 - 1080.0).abs() < 1.0);
     }
 
